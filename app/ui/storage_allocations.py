@@ -60,7 +60,7 @@ def render_storage_allocations_fragment():
             provider_overrides[t] = prov
     quotes = get_quotes_cached(
         tickers_sorted,
-        cache_ttl_sec=0,
+        cache_ttl_sec=PRICES_REFRESH_SEC,
         provider_overrides=provider_overrides,
     )
 

@@ -13,16 +13,20 @@ from app.db import (
     apply_allocation_user_sheet_migration,
     apply_tovary_broker_subclass_names_migration,
     apply_zoloto_broker_parens_subclass_migration,
+    apply_crypto_subclass_canonical_migration,
+    apply_crypto_two_subclasses_migration,
     apply_default_target_percentages_if_unset,
     reconcile_asset_class_targets,
 )
-from app.ui.table import render_portfolio_table
+from app.ui.table import render_portfolio_table, render_portfolio_total_metric
 from app.ui.storage_allocations import render_storage_allocations
 from app.ui.transactions import render_transactions_table
 from app.ui.asset_classes import render_asset_classes
 from app.ui.ticker_subclasses import render_ticker_subclasses
 from app.ui.positions import render_add_position, render_remove_position
 from app.ui.currency_sidebar import render_currency_sidebar
+from app.ui.rebalancing import render_rebalancing
+from app.ui.performance import render_performance
 
 st.set_page_config(page_title="Портфель", layout="wide")
 
@@ -32,10 +36,10 @@ seed_asset_classes_if_empty()
 apply_allocation_user_sheet_migration()
 apply_tovary_broker_subclass_names_migration()
 apply_zoloto_broker_parens_subclass_migration()
+apply_crypto_subclass_canonical_migration()
+apply_crypto_two_subclasses_migration()
 apply_default_target_percentages_if_unset()
 reconcile_asset_class_targets()
-
-st.title("Портфель")
 
 # Sidebar: FX + display currency, then actions
 with st.sidebar:
@@ -58,9 +62,11 @@ with st.sidebar:
     with classes_tab:
         render_asset_classes()
 
-# Main: portfolio summary, storage breakdown, transaction log
-tab_summary, tab_storage, tab_tx = st.tabs(
-    ["Сводка портфеля", "По местам хранения", "Транзакции"]
+st.title("Портфель")
+render_portfolio_total_metric()
+# Main: portfolio summary, storage breakdown, transactions, rebalancing and performance
+tab_summary, tab_storage, tab_tx, tab_rebalance, tab_performance = st.tabs(
+    ["Сводка портфеля", "По местам хранения", "Транзакции", "Ребалансировка", "Доходность"]
 )
 with tab_summary:
     render_portfolio_table()
@@ -69,3 +75,7 @@ with tab_storage:
 with tab_tx:
     st.caption("Все покупки и продажи по дате (новые сверху).")
     render_transactions_table()
+with tab_rebalance:
+    render_rebalancing()
+with tab_performance:
+    render_performance()

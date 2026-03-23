@@ -26,6 +26,62 @@ def _class_by_id():
     return {c.id: c for c in list_asset_classes()}
 
 
+def render_portfolio_total_metric():
+    """Top-level metric for total portfolio value (above main tabs)."""
+    positions = list_positions_by_ticker()
+    display_ccy = st.session_state.get("display_currency", "RUB")
+    if not positions:
+        st.session_state["portfolio_total"] = {
+            "currency": display_ccy,
+            "total": 0.0,
+            "priced": 0,
+            "total_tickers": 0,
+        }
+        st.metric(f"Стоимость портфеля ({display_ccy})", "—")
+        return
+
+    fx = st.session_state.get("fx_cache") or {}
+    rub = float(fx.get("rub") or 95.0)
+    eur = float(fx.get("eur") or 0.92)
+
+    tickers = list({p.ticker for p in positions})
+    provider_overrides = {}
+    for t in tickers:
+        prov = get_instrument_provider(t)
+        if prov:
+            provider_overrides[t] = prov
+    quotes = get_quotes_cached(
+        tickers,
+        cache_ttl_sec=PRICES_REFRESH_SEC,
+        provider_overrides=provider_overrides,
+    )
+
+    portfolio_total = 0.0
+    n_with_price = 0
+    for p in positions:
+        q = quotes.get(p.ticker)
+        price = q.price if q else None
+        quote_ccy = q.currency if q else infer_quote_currency(p.ticker)
+        if price is None:
+            continue
+        value_native = price * p.amount
+        value_disp = convert_amount(value_native, quote_ccy, display_ccy, rub, eur)
+        portfolio_total += value_disp
+        n_with_price += 1
+
+    st.session_state["portfolio_total"] = {
+        "currency": display_ccy,
+        "total": portfolio_total,
+        "priced": n_with_price,
+        "total_tickers": len(positions),
+    }
+    st.metric(
+        f"Стоимость портфеля ({display_ccy})",
+        format_money(portfolio_total, display_ccy) if n_with_price > 0 else "—",
+        help="Сумма стоимостей позиций по текущим котировкам в выбранной валюте.",
+    )
+
+
 @st.fragment(run_every=timedelta(seconds=PRICES_REFRESH_SEC))
 def render_portfolio_table_fragment():
     positions = list_positions_by_ticker()
@@ -52,10 +108,10 @@ def render_portfolio_table_fragment():
         prov = get_instrument_provider(t)
         if prov:
             provider_overrides[t] = prov
-    # Без кэша: каждый тик fragment — свежие цены
+    # Короткий TTL убирает повторные медленные запросы внутри одного окна обновления fragment.
     quotes = get_quotes_cached(
         tickers,
-        cache_ttl_sec=0,
+        cache_ttl_sec=PRICES_REFRESH_SEC,
         provider_overrides=provider_overrides,
     )
 
@@ -99,16 +155,6 @@ def render_portfolio_table_fragment():
         "total_tickers": len(positions),
     }
 
-    st.metric(
-        f"Стоимость портфеля ({display_ccy})",
-        format_money(portfolio_total, display_ccy) if n_with_price > 0 else "—",
-        help="Сумма стоимостей позиций по текущим котировкам в выбранной валюте.",
-    )
-    if n_with_price > 0 and n_with_price < len(positions):
-        st.caption(
-            f"В сумму входят **{n_with_price}** из **{len(positions)}** тикеров (остальные без котировки)."
-        )
-
     st.caption(
         f"Цены и стоимость в **{display_ccy}**; котировки обновляются ~каждые **{PRICES_REFRESH_SEC} с** "
         f"(валюта котировки — из API провайдера, затем конвертация по курсу в боковой панели). "
@@ -121,6 +167,7 @@ def render_portfolio_table_fragment():
         key="portfolio_summary_df",
     )
     if st.button("Обновить цены сейчас", key="refresh_prices_now"):
+        st.session_state.pop("price_cache", None)
         st.rerun()
 
 

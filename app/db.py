@@ -36,13 +36,8 @@ ASSET_SUBCLASS_DEFAULT_ROWS = [
     ("Облигации", "Облигации всего мира кроме США", 4.650, 5),
     ("Товары", "Золото (Иностранный брокер)", 2.325, 1),
     ("Товары", "Золото (Российский брокер)", 2.325, 2),
-    ("Криптовалюта", "Bitcoin", 2.100, 1),
-    ("Криптовалюта", "Ethereum", 2.100, 2),
-    ("Криптовалюта", "Solana", 0.700, 3),
-    ("Криптовалюта", "Avalanche", 0.700, 4),
-    ("Криптовалюта", "BNB", 0.700, 5),
-    ("Криптовалюта", "Proton", 0.700, 6),
-    ("Криптовалюта", "Прочая криптовалюта", 0.0, 7),
+    ("Криптовалюта", "BTC+ETH", 4.200, 1),
+    ("Криптовалюта", "Прочая криптовалюта", 2.800, 2),
 ]
 
 
@@ -154,6 +149,17 @@ def init_db():
                 name TEXT NOT NULL UNIQUE,
                 sort_order INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS historical_quotes (
+                ticker TEXT NOT NULL,
+                quote_date TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_symbol TEXT,
+                price REAL,
+                currency TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (ticker, quote_date)
+            );
         """)
         conn.commit()
         # Стартовые места хранения (IB, Тинькофф, кошельки…) + колонка storage_id у сделок
@@ -176,6 +182,12 @@ def init_db():
             conn.execute("SELECT asset_subclass_id FROM instruments LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE instruments ADD COLUMN asset_subclass_id INTEGER")
+            conn.commit()
+        # instruments.buy_blocked — тикер запрещён к покупке в ребалансировке
+        try:
+            conn.execute("SELECT buy_blocked FROM instruments LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE instruments ADD COLUMN buy_blocked INTEGER NOT NULL DEFAULT 0")
             conn.commit()
         # Migrate existing positions into transactions (one tx per position)
         cur = conn.execute("SELECT COUNT(*) FROM transactions")
@@ -289,6 +301,8 @@ ALLOCATION_SHEET_MIGRATION_ID = "allocation_user_sheet_2025"
 TOVARY_BROKER_SUBCLASS_NAMES_MIGRATION_ID = "subclass_tovary_broker_names_2026"
 # Если уже применялась старая версия миграции с короткими именами — довести до «Золото (…)».
 ZOLOTO_BROKER_PARENS_MIGRATION_ID = "subclass_zoloto_broker_parens_2026"
+CRYPTO_SUBCLASS_CANONICAL_MIGRATION_ID = "subclass_crypto_canonical_2026"
+CRYPTO_TWO_SUBCLASSES_MIGRATION_ID = "subclass_crypto_two_subclasses_2026"
 
 
 def _normalize_tovary_zoloto_broker_subclass_names_in_conn(conn: sqlite3.Connection) -> None:
@@ -361,6 +375,305 @@ def apply_zoloto_broker_parens_subclass_migration() -> None:
         conn.execute(
             "INSERT INTO _schema_migrations (id) VALUES (?)",
             (ZOLOTO_BROKER_PARENS_MIGRATION_ID,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def apply_crypto_subclass_canonical_migration() -> None:
+    """
+    Однократно: привести крипто-подклассы к единому виду «Прочая криптовалюта».
+    - объединяет дубликаты «Прочие крипто» / «Прочая криптовалюты»;
+    - переносит ссылки из transactions/instruments;
+    - удаляет тикерные подклассы (Bitcoin/Ethereum/...) после переноса.
+    """
+    conn = get_conn()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS _schema_migrations (id TEXT PRIMARY KEY)")
+        if conn.execute(
+            "SELECT 1 FROM _schema_migrations WHERE id = ?",
+            (CRYPTO_SUBCLASS_CANONICAL_MIGRATION_ID,),
+        ).fetchone():
+            return
+
+        crypto_cls = conn.execute(
+            "SELECT id FROM asset_classes WHERE name = 'Криптовалюта' LIMIT 1"
+        ).fetchone()
+        if crypto_cls is None:
+            conn.execute(
+                "INSERT INTO _schema_migrations (id) VALUES (?)",
+                (CRYPTO_SUBCLASS_CANONICAL_MIGRATION_ID,),
+            )
+            conn.commit()
+            return
+
+        crypto_class_id = int(crypto_cls["id"])
+        canonical_name = "Прочая криптовалюта"
+
+        # Сначала нормализуем явные варианты имени дубликата.
+        for old_name in ("Прочая криптовалюты", "Прочие крипто"):
+            conn.execute(
+                "UPDATE asset_subclasses SET name = ? WHERE asset_class_id = ? AND name = ?",
+                (canonical_name, crypto_class_id, old_name),
+            )
+
+        rows = conn.execute(
+            """SELECT id, target_pct, sort_order
+               FROM asset_subclasses
+               WHERE asset_class_id = ? AND name = ?
+               ORDER BY id""",
+            (crypto_class_id, canonical_name),
+        ).fetchall()
+
+        canonical_id: Optional[int] = None
+        if rows:
+            canonical_id = int(rows[0]["id"])
+            if len(rows) > 1:
+                merged_target = round(sum(float(r["target_pct"]) for r in rows), 3)
+                best_sort = min(int(r["sort_order"]) for r in rows)
+                dup_ids = [int(r["id"]) for r in rows[1:]]
+                q_marks = ",".join("?" for _ in dup_ids)
+                conn.execute(
+                    f"UPDATE transactions SET asset_subclass_id = ? WHERE asset_subclass_id IN ({q_marks})",
+                    (canonical_id, *dup_ids),
+                )
+                conn.execute(
+                    f"UPDATE instruments SET asset_subclass_id = ? WHERE asset_subclass_id IN ({q_marks})",
+                    (canonical_id, *dup_ids),
+                )
+                conn.execute(
+                    f"DELETE FROM asset_subclasses WHERE id IN ({q_marks})",
+                    tuple(dup_ids),
+                )
+                conn.execute(
+                    "UPDATE asset_subclasses SET target_pct = ?, sort_order = ? WHERE id = ?",
+                    (merged_target, best_sort, canonical_id),
+                )
+        else:
+            inserted = conn.execute(
+                """INSERT INTO asset_subclasses (asset_class_id, name, target_pct, sort_order)
+                   VALUES (?, ?, ?, ?)""",
+                (crypto_class_id, canonical_name, 0.0, 1),
+            )
+            canonical_id = int(inserted.lastrowid)
+
+        ticker_named_crypto = ("Bitcoin", "Ethereum", "Solana", "Avalanche", "BNB", "Proton")
+        for n in ticker_named_crypto:
+            row = conn.execute(
+                "SELECT id, target_pct FROM asset_subclasses WHERE asset_class_id = ? AND name = ? LIMIT 1",
+                (crypto_class_id, n),
+            ).fetchone()
+            if row is None:
+                continue
+            sid = int(row["id"])
+            pct = float(row["target_pct"] or 0.0)
+            conn.execute(
+                "UPDATE transactions SET asset_subclass_id = ? WHERE asset_subclass_id = ?",
+                (canonical_id, sid),
+            )
+            conn.execute(
+                "UPDATE instruments SET asset_subclass_id = ? WHERE asset_subclass_id = ?",
+                (canonical_id, sid),
+            )
+            conn.execute("DELETE FROM asset_subclasses WHERE id = ?", (sid,))
+            conn.execute(
+                "UPDATE asset_subclasses SET target_pct = ROUND(target_pct + ?, 3) WHERE id = ?",
+                (pct, canonical_id),
+            )
+
+        conn.execute(
+            "UPDATE asset_subclasses SET name = ?, sort_order = 1 WHERE id = ?",
+            (canonical_name, canonical_id),
+        )
+        _reconcile_asset_class_targets_in_conn(conn)
+        conn.execute(
+            "INSERT INTO _schema_migrations (id) VALUES (?)",
+            (CRYPTO_SUBCLASS_CANONICAL_MIGRATION_ID,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def apply_crypto_two_subclasses_migration() -> None:
+    """
+    Однократно: привести крипто-класс к 2 подклассам:
+    - BTC+ETH
+    - Прочая криптовалюта
+    Любые остальные крипто-подклассы объединяются в «Прочая криптовалюта».
+    """
+    conn = get_conn()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS _schema_migrations (id TEXT PRIMARY KEY)")
+        if conn.execute(
+            "SELECT 1 FROM _schema_migrations WHERE id = ?",
+            (CRYPTO_TWO_SUBCLASSES_MIGRATION_ID,),
+        ).fetchone():
+            return
+
+        cls = conn.execute(
+            "SELECT id FROM asset_classes WHERE name = 'Криптовалюта' LIMIT 1"
+        ).fetchone()
+        if cls is None:
+            conn.execute(
+                "INSERT INTO _schema_migrations (id) VALUES (?)",
+                (CRYPTO_TWO_SUBCLASSES_MIGRATION_ID,),
+            )
+            conn.commit()
+            return
+        crypto_class_id = int(cls["id"])
+
+        # Нормализуем старые варианты названий before grouping.
+        for old in ("Прочие крипто", "Прочая криптовалюты"):
+            conn.execute(
+                "UPDATE asset_subclasses SET name = 'Прочая криптовалюта' WHERE asset_class_id = ? AND name = ?",
+                (crypto_class_id, old),
+            )
+
+        def _ensure_row(name: str, sort_order: int, default_pct: float) -> int:
+            rows = conn.execute(
+                """SELECT id, target_pct
+                   FROM asset_subclasses
+                   WHERE asset_class_id = ? AND name = ?
+                   ORDER BY id""",
+                (crypto_class_id, name),
+            ).fetchall()
+            if rows:
+                sid = int(rows[0]["id"])
+                if len(rows) > 1:
+                    dup_ids = [int(r["id"]) for r in rows[1:]]
+                    q_marks = ",".join("?" for _ in dup_ids)
+                    merged_pct = round(sum(float(r["target_pct"] or 0.0) for r in rows), 3)
+                    conn.execute(
+                        f"UPDATE transactions SET asset_subclass_id = ? WHERE asset_subclass_id IN ({q_marks})",
+                        (sid, *dup_ids),
+                    )
+                    conn.execute(
+                        f"UPDATE instruments SET asset_subclass_id = ? WHERE asset_subclass_id IN ({q_marks})",
+                        (sid, *dup_ids),
+                    )
+                    conn.execute(
+                        f"DELETE FROM asset_subclasses WHERE id IN ({q_marks})",
+                        tuple(dup_ids),
+                    )
+                    conn.execute(
+                        "UPDATE asset_subclasses SET target_pct = ? WHERE id = ?",
+                        (merged_pct, sid),
+                    )
+                conn.execute(
+                    "UPDATE asset_subclasses SET sort_order = ? WHERE id = ?",
+                    (sort_order, sid),
+                )
+                return sid
+
+            cur = conn.execute(
+                """INSERT INTO asset_subclasses (asset_class_id, name, target_pct, sort_order)
+                   VALUES (?, ?, ?, ?)""",
+                (crypto_class_id, name, default_pct, sort_order),
+            )
+            return int(cur.lastrowid)
+
+        btc_eth_id = _ensure_row("BTC+ETH", 1, 4.2)
+        other_id = _ensure_row("Прочая криптовалюта", 2, 2.8)
+
+        # Старые "по тикерам" названия: BTC/ETH -> BTC+ETH, остальные -> Прочая.
+        legacy_to_target = {
+            "Bitcoin": btc_eth_id,
+            "Ethereum": btc_eth_id,
+            "Solana": other_id,
+            "Avalanche": other_id,
+            "BNB": other_id,
+            "Proton": other_id,
+        }
+        for legacy_name, target_id in legacy_to_target.items():
+            row = conn.execute(
+                "SELECT id, target_pct FROM asset_subclasses WHERE asset_class_id = ? AND name = ? LIMIT 1",
+                (crypto_class_id, legacy_name),
+            ).fetchone()
+            if row is None:
+                continue
+            sid = int(row["id"])
+            pct = float(row["target_pct"] or 0.0)
+            conn.execute(
+                "UPDATE transactions SET asset_subclass_id = ? WHERE asset_subclass_id = ?",
+                (target_id, sid),
+            )
+            conn.execute(
+                "UPDATE instruments SET asset_subclass_id = ? WHERE asset_subclass_id = ?",
+                (target_id, sid),
+            )
+            conn.execute(
+                "UPDATE asset_subclasses SET target_pct = ROUND(target_pct + ?, 3) WHERE id = ?",
+                (pct, target_id),
+            )
+            conn.execute("DELETE FROM asset_subclasses WHERE id = ?", (sid,))
+
+        # По тикерам явно выравниваем ссылки на нужный подкласс.
+        conn.execute(
+            """UPDATE transactions
+               SET asset_subclass_id = ?
+               WHERE UPPER(ticker) IN ('BTC', 'ETH')
+                 AND asset_subclass_id IN (SELECT id FROM asset_subclasses WHERE asset_class_id = ?)""",
+            (btc_eth_id, crypto_class_id),
+        )
+        conn.execute(
+            """UPDATE transactions
+               SET asset_subclass_id = ?
+               WHERE UPPER(ticker) NOT IN ('BTC', 'ETH')
+                 AND asset_subclass_id IN (SELECT id FROM asset_subclasses WHERE asset_class_id = ?)""",
+            (other_id, crypto_class_id),
+        )
+        conn.execute(
+            """UPDATE instruments
+               SET asset_subclass_id = ?
+               WHERE UPPER(ticker) IN ('BTC', 'ETH')
+                 AND asset_subclass_id IN (SELECT id FROM asset_subclasses WHERE asset_class_id = ?)""",
+            (btc_eth_id, crypto_class_id),
+        )
+        conn.execute(
+            """UPDATE instruments
+               SET asset_subclass_id = ?
+               WHERE UPPER(ticker) NOT IN ('BTC', 'ETH')
+                 AND asset_subclass_id IN (SELECT id FROM asset_subclasses WHERE asset_class_id = ?)""",
+            (other_id, crypto_class_id),
+        )
+
+        # Любые прочие крипто-подклассы объединяем в «Прочая криптовалюта».
+        extra_rows = conn.execute(
+            """SELECT id, target_pct
+               FROM asset_subclasses
+               WHERE asset_class_id = ?
+                 AND id NOT IN (?, ?)
+               ORDER BY id""",
+            (crypto_class_id, btc_eth_id, other_id),
+        ).fetchall()
+        for r in extra_rows:
+            sid = int(r["id"])
+            pct = float(r["target_pct"] or 0.0)
+            conn.execute(
+                "UPDATE transactions SET asset_subclass_id = ? WHERE asset_subclass_id = ?",
+                (other_id, sid),
+            )
+            conn.execute(
+                "UPDATE instruments SET asset_subclass_id = ? WHERE asset_subclass_id = ?",
+                (other_id, sid),
+            )
+            conn.execute(
+                "UPDATE asset_subclasses SET target_pct = ROUND(target_pct + ?, 3) WHERE id = ?",
+                (pct, other_id),
+            )
+            conn.execute("DELETE FROM asset_subclasses WHERE id = ?", (sid,))
+
+        conn.execute("UPDATE asset_subclasses SET name = 'BTC+ETH', sort_order = 1 WHERE id = ?", (btc_eth_id,))
+        conn.execute(
+            "UPDATE asset_subclasses SET name = 'Прочая криптовалюта', sort_order = 2 WHERE id = ?",
+            (other_id,),
+        )
+        _reconcile_asset_class_targets_in_conn(conn)
+        conn.execute(
+            "INSERT INTO _schema_migrations (id) VALUES (?)",
+            (CRYPTO_TWO_SUBCLASSES_MIGRATION_ID,),
         )
         conn.commit()
     finally:
@@ -534,6 +847,59 @@ def set_instrument_asset_subclass(ticker: str, asset_subclass_id: int):
         conn.close()
 
 
+def is_ticker_buy_blocked(ticker: str) -> bool:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT buy_blocked FROM instruments WHERE ticker = ?",
+            (ticker.upper(),),
+        ).fetchone()
+        return bool(row and int(row["buy_blocked"] or 0) == 1)
+    finally:
+        conn.close()
+
+
+def list_buy_blocked_tickers() -> List[str]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT ticker FROM instruments WHERE COALESCE(buy_blocked, 0) = 1 ORDER BY ticker"
+        ).fetchall()
+        return [str(r["ticker"]).upper() for r in rows]
+    finally:
+        conn.close()
+
+
+def set_ticker_buy_blocked(ticker: str, blocked: bool) -> None:
+    """Пометить тикер как недоступный для покупки в ребалансировке."""
+    from app.services.prices import _detect_provider
+
+    t = ticker.strip().upper()
+    if not t:
+        return
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT ticker FROM instruments WHERE ticker = ?",
+            (t,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE instruments SET buy_blocked = ? WHERE ticker = ?",
+                (1 if blocked else 0, t),
+            )
+        else:
+            prov, psym = _detect_provider(t)
+            conn.execute(
+                """INSERT INTO instruments (ticker, provider, provider_symbol, buy_blocked)
+                   VALUES (?, ?, ?, ?)""",
+                (t, prov, psym or "", 1 if blocked else 0),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_default_storage_id() -> int:
     """Первый id по sort_order (без пункта «По умолчанию» — только список DEFAULT + пользовательские)."""
     conn = get_conn()
@@ -611,6 +977,106 @@ def list_distinct_tickers() -> List[str]:
                ) ORDER BY ticker"""
         ).fetchall()
         return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+# --- Historical quotes cache ---
+def upsert_historical_quote(
+    ticker: str,
+    quote_date: str,
+    provider: str,
+    provider_symbol: Optional[str],
+    price: Optional[float],
+    currency: str,
+) -> None:
+    """Upsert one daily historical quote row."""
+    t = ticker.strip().upper()
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO historical_quotes (
+                   ticker, quote_date, provider, provider_symbol, price, currency, updated_at
+               )
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(ticker, quote_date) DO UPDATE SET
+                   provider = excluded.provider,
+                   provider_symbol = excluded.provider_symbol,
+                   price = excluded.price,
+                   currency = excluded.currency,
+                   updated_at = datetime('now')""",
+            (t, quote_date, provider, provider_symbol or "", price, currency.upper()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_historical_quotes_bulk(rows: List[tuple]) -> None:
+    """
+    Bulk upsert historical quotes.
+    Row format: (ticker, quote_date, provider, provider_symbol, price, currency)
+    """
+    if not rows:
+        return
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """INSERT INTO historical_quotes (
+                   ticker, quote_date, provider, provider_symbol, price, currency, updated_at
+               )
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(ticker, quote_date) DO UPDATE SET
+                   provider = excluded.provider,
+                   provider_symbol = excluded.provider_symbol,
+                   price = excluded.price,
+                   currency = excluded.currency,
+                   updated_at = datetime('now')""",
+            [
+                (
+                    str(t).strip().upper(),
+                    str(d),
+                    str(p),
+                    (ps or ""),
+                    (None if pr is None else float(pr)),
+                    str(c).upper(),
+                )
+                for t, d, p, ps, pr, c in rows
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_cached_historical_quotes(
+    ticker: str,
+    date_from: str,
+    date_to: str,
+) -> List[tuple]:
+    """
+    Return cached historical quotes for ticker in inclusive date range.
+    Output rows: (quote_date, price, currency, provider, provider_symbol)
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT quote_date, price, currency, provider, provider_symbol
+               FROM historical_quotes
+               WHERE ticker = ? AND quote_date >= ? AND quote_date <= ?
+               ORDER BY quote_date""",
+            (ticker.strip().upper(), date_from, date_to),
+        ).fetchall()
+        return [
+            (
+                str(r["quote_date"]),
+                (None if r["price"] is None else float(r["price"])),
+                str(r["currency"]).upper(),
+                str(r["provider"]),
+                (r["provider_symbol"] or ""),
+            )
+            for r in rows
+        ]
     finally:
         conn.close()
 

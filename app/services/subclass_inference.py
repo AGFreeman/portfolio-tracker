@@ -54,18 +54,9 @@ def infer_subclass_name(ticker: str) -> Optional[str]:
         return TICKER_TO_SUBCLASS_NAME[up]
 
     if is_crypto_ticker(up):
-        if up == "BTC":
-            return "Bitcoin"
-        if up == "ETH":
-            return "Ethereum"
-        if up == "SOL":
-            return "Solana"
-        if up == "AVAX":
-            return "Avalanche"
-        if up == "BNB":
-            return "BNB"
-        if up == "XPR":
-            return "Proton"
+        # BTC и ETH в отдельном подкорзине; остальная крипта — в «Прочая криптовалюта».
+        if up in ("BTC", "ETH"):
+            return "BTC+ETH"
         return "Прочая криптовалюта"
 
     if up in MOEX_TICKERS:

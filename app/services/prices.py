@@ -1,6 +1,7 @@
 """Fetch live price by ticker. Multi-provider: yfinance, MOEX ISS, CoinGecko. Session cache."""
 import re
 import time
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -20,6 +21,8 @@ COINGECKO_IDS = {
 MOEX_TICKERS = {
     "TMOS", "SBGB", "SBRB", "TGLD", "TSPX", "TEUS", "TEMS", "GXC", "EFG",
 }
+
+_HTTP = requests.Session()
 
 
 @dataclass
@@ -215,7 +218,7 @@ def _price_coingecko(coin_id: str) -> PriceQuote:
     """Запрос vs_currencies=usd — валюта котировки USD."""
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
     try:
-        r = requests.get(url, timeout=10)
+        r = _HTTP.get(url, timeout=6)
         r.raise_for_status()
         data = r.json()
         if coin_id in data and "usd" in data[coin_id]:
@@ -223,6 +226,43 @@ def _price_coingecko(coin_id: str) -> PriceQuote:
     except Exception:
         pass
     return PriceQuote(price=None, currency="USD")
+
+
+def _price_coingecko_many(coin_ids: List[str]) -> Dict[str, PriceQuote]:
+    """Batch CoinGecko request to reduce latency for multiple crypto tickers."""
+    ids = [c for c in dict.fromkeys(coin_ids) if c]
+    if not ids:
+        return {}
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    out: Dict[str, PriceQuote] = {c: PriceQuote(price=None, currency="USD") for c in ids}
+    try:
+        r = _HTTP.get(
+            url,
+            params={"ids": ",".join(ids), "vs_currencies": "usd"},
+            timeout=6,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
+        for coin_id in ids:
+            usd = (data.get(coin_id) or {}).get("usd")
+            if usd is None:
+                continue
+            out[coin_id] = PriceQuote(price=float(usd), currency="USD")
+    except Exception:
+        pass
+    return out
+
+
+def _resolve_provider_symbol(
+    ticker: str,
+    provider_overrides: Optional[dict] = None,
+) -> Tuple[str, str]:
+    overrides = provider_overrides or {}
+    ov = overrides.get(ticker)
+    if ov:
+        provider, symbol = ov[0], (ov[1] or "").strip()
+        return provider, symbol or ticker.upper().strip()
+    return _detect_provider(ticker)
 
 
 def fetch_price_quote(
@@ -254,6 +294,146 @@ def get_price(
     provider_symbol_override: Optional[str] = None,
 ) -> Optional[float]:
     return fetch_price_quote(ticker, provider_override, provider_symbol_override).price
+
+
+def _daterange_iso(date_from: str, date_to: str) -> List[str]:
+    d0 = datetime.strptime(date_from, "%Y-%m-%d").date()
+    d1 = datetime.strptime(date_to, "%Y-%m-%d").date()
+    if d1 < d0:
+        return []
+    days = (d1 - d0).days
+    return [(d0 + timedelta(days=i)).isoformat() for i in range(days + 1)]
+
+
+def fetch_historical_prices_yfinance(symbol: str, date_from: str, date_to: str) -> Dict[str, PriceQuote]:
+    out: Dict[str, PriceQuote] = {}
+    try:
+        import yfinance as yf
+
+        # yfinance end is exclusive; shift by +1 day
+        d_end = (datetime.strptime(date_to, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
+        hist = yf.Ticker(symbol).history(start=date_from, end=d_end, interval="1d", auto_adjust=False)
+        ccy = "USD"
+        try:
+            info = yf.Ticker(symbol).fast_info
+            raw = getattr(info, "currency", None) if not isinstance(info, dict) else info.get("currency")
+            norm = _normalize_currency_code(raw)
+            if norm:
+                ccy = norm
+        except Exception:
+            pass
+        if hist is None or hist.empty:
+            return out
+        for idx, row in hist.iterrows():
+            if "Close" not in row or row["Close"] is None:
+                continue
+            day = idx.date().isoformat()
+            try:
+                out[day] = PriceQuote(price=float(row["Close"]), currency=ccy)
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return {}
+    return out
+
+
+def fetch_historical_prices_moex(symbol: str, date_from: str, date_to: str) -> Dict[str, PriceQuote]:
+    out: Dict[str, PriceQuote] = {}
+    sec = symbol.upper().strip()
+    for board in ("TQBR", "TQTF"):
+        url = (
+            f"https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/{board}/securities/{sec}.json"
+            f"?from={date_from}&till={date_to}&iss.meta=off"
+        )
+        try:
+            r = _HTTP.get(url, timeout=12)
+            if not r.ok:
+                continue
+            data = r.json() or {}
+            hist = data.get("history", {})
+            cols = hist.get("columns", [])
+            rows = hist.get("data", [])
+            if not cols or not rows:
+                continue
+            idx_trade_date = cols.index("TRADEDATE") if "TRADEDATE" in cols else -1
+            idx_close = cols.index("CLOSE") if "CLOSE" in cols else -1
+            idx_legal_close = cols.index("LEGALCLOSEPRICE") if "LEGALCLOSEPRICE" in cols else -1
+            idx_waprice = cols.index("WAPRICE") if "WAPRICE" in cols else -1
+            if idx_trade_date < 0:
+                continue
+            for row in rows:
+                day = row[idx_trade_date]
+                if not day:
+                    continue
+                px = None
+                for idx_px in (idx_close, idx_legal_close, idx_waprice):
+                    if idx_px >= 0 and idx_px < len(row) and row[idx_px] is not None:
+                        px = row[idx_px]
+                        break
+                try:
+                    if px is not None:
+                        out[str(day)] = PriceQuote(price=float(px), currency="RUB")
+                except (TypeError, ValueError):
+                    continue
+            if out:
+                break
+        except Exception:
+            continue
+    return out
+
+
+def fetch_historical_prices_coingecko(coin_id: str, date_from: str, date_to: str) -> Dict[str, PriceQuote]:
+    out: Dict[str, PriceQuote] = {}
+    try:
+        d0 = datetime.strptime(date_from, "%Y-%m-%d").date()
+        d1 = datetime.strptime(date_to, "%Y-%m-%d").date()
+    except ValueError:
+        return out
+    if d1 < d0:
+        return out
+    days = max(1, (d1 - d0).days + 1)
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    try:
+        r = _HTTP.get(url, params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=12)
+        r.raise_for_status()
+        data = r.json() or {}
+        for item in data.get("prices", []):
+            if not isinstance(item, list) or len(item) < 2:
+                continue
+            ts_ms, px = item[0], item[1]
+            try:
+                day = datetime.utcfromtimestamp(float(ts_ms) / 1000.0).date()
+                if d0 <= day <= d1:
+                    out[day.isoformat()] = PriceQuote(price=float(px), currency="USD")
+            except (TypeError, ValueError, OSError):
+                continue
+    except Exception:
+        return out
+    return out
+
+
+def fetch_historical_quotes(
+    ticker: str,
+    date_from: str,
+    date_to: str,
+    provider_override: Optional[str] = None,
+    provider_symbol_override: Optional[str] = None,
+) -> Dict[str, PriceQuote]:
+    """Fetch historical quotes by provider for an inclusive date range."""
+    if provider_override:
+        provider = provider_override
+        symbol = (provider_symbol_override or "").strip() or ticker.upper().strip()
+    else:
+        provider, symbol = _detect_provider(ticker)
+
+    if provider == "moex_iss":
+        return fetch_historical_prices_moex(symbol, date_from, date_to)
+    if provider == "coingecko":
+        return fetch_historical_prices_coingecko(symbol, date_from, date_to)
+    if provider == "yfinance":
+        yf_symbol = f"{symbol}-USD" if symbol in COINGECKO_IDS and "-" not in symbol else symbol
+        return fetch_historical_prices_yfinance(yf_symbol, date_from, date_to)
+    return fetch_historical_prices_yfinance(symbol, date_from, date_to)
 
 
 def _unpack_cached_quote(ticker: str, cached) -> PriceQuote:
@@ -289,29 +469,51 @@ def get_quotes_cached(
     result: Dict[str, PriceQuote] = {}
 
     if cache_ttl_sec <= 0:
-        for t in tickers:
-            ov = overrides.get(t)
-            if ov:
-                result[t] = fetch_price_quote(t, provider_override=ov[0], provider_symbol_override=ov[1])
-            else:
-                result[t] = fetch_price_quote(t)
+        missing = list(dict.fromkeys(tickers))
+        plan = {t: _resolve_provider_symbol(t, provider_overrides=overrides) for t in missing}
+        cg_targets = {t: sym for t, (prov, sym) in plan.items() if prov == "coingecko"}
+        if cg_targets:
+            cg_quotes = _price_coingecko_many(list(cg_targets.values()))
+            for t, coin_id in cg_targets.items():
+                result[t] = cg_quotes.get(coin_id, PriceQuote(price=None, currency="USD"))
+        for t in missing:
+            if t in result:
+                continue
+            prov, sym = plan[t]
+            result[t] = fetch_price_quote(
+                t,
+                provider_override=prov,
+                provider_symbol_override=sym,
+            )
         return result
 
     if cache["ts"] + cache_ttl_sec < now or not cache["data"]:
         cache["ts"] = now
         cache["data"] = {}
 
+    missing: List[str] = []
     for t in tickers:
         if t in cache["data"]:
             result[t] = _unpack_cached_quote(t, cache["data"][t])
             continue
-        ov = overrides.get(t)
-        if ov:
-            q = fetch_price_quote(t, provider_override=ov[0], provider_symbol_override=ov[1])
-        else:
-            q = fetch_price_quote(t)
-        cache["data"][t] = q
-        result[t] = q
+        missing.append(t)
+
+    if missing:
+        plan = {t: _resolve_provider_symbol(t, provider_overrides=overrides) for t in missing}
+        cg_targets = {t: sym for t, (prov, sym) in plan.items() if prov == "coingecko"}
+        if cg_targets:
+            cg_quotes = _price_coingecko_many(list(cg_targets.values()))
+            for t, coin_id in cg_targets.items():
+                q = cg_quotes.get(coin_id, PriceQuote(price=None, currency="USD"))
+                cache["data"][t] = q
+                result[t] = q
+        for t in missing:
+            if t in result:
+                continue
+            prov, sym = plan[t]
+            q = fetch_price_quote(t, provider_override=prov, provider_symbol_override=sym)
+            cache["data"][t] = q
+            result[t] = q
     return result
 
 

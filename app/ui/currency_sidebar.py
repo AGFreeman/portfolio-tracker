@@ -4,7 +4,7 @@ from datetime import timedelta
 
 import streamlit as st
 
-from app.services.fx import fetch_usd_cross_rates, format_money
+from app.services.fx import fetch_usd_cross_rates
 
 # Интервал фонового обновления курсов (сек)
 FX_REFRESH_SEC = 60
@@ -47,14 +47,3 @@ def render_currency_sidebar():
         key="display_currency",
     )
 
-    pt = st.session_state.get("portfolio_total")
-    if pt and pt.get("priced", 0) > 0:
-        st.metric(
-            "Портфель (оценка)",
-            format_money(float(pt["total"]), str(pt["currency"])),
-            help="Обновляется на вкладке «Сводка портфеля» вместе с ценами.",
-        )
-        if pt.get("priced", 0) < pt.get("total_tickers", 0):
-            st.caption(
-                f"Частично: {pt['priced']}/{pt['total_tickers']} тикеров с котировкой."
-            )
