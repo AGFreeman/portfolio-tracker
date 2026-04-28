@@ -34,6 +34,10 @@ DISABLED_QUOTES_TTL_SEC = 24 * 60 * 60
 _ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
 _PROVIDER_SYMBOL_BY_TICKER: Dict[str, Tuple[str, str]] = {}
 _INSTRUMENT_KIND_BY_PROVIDER_SYMBOL: Dict[Tuple[str, str], Optional[str]] = {}
+_HISTORICAL_SYMBOL_FALLBACKS: Dict[str, List[str]] = {
+    # Delisted/acquired tickers: fallback to successor symbol for history backfill.
+    "ANSS": ["SNPS"],
+}
 
 
 @dataclass
@@ -227,8 +231,9 @@ def normalize_quote_price_for_valuation(
     kind = _detect_instrument_kind(ticker, provider=prov, provider_symbol=sym)
     if kind != "bond":
         return p
-    # RU bonds from MOEX/T-Bank are typically quoted as % of 1000 RUB nominal.
-    if ccy == "RUB" and prov in ("moex_iss", "tbank") and 0 < p <= 300:
+    # MOEX/T-Bank bonds are typically quoted as % of nominal (100 = 100% of 1000).
+    # Apply for bond instruments regardless of quote currency.
+    if prov in ("moex_iss", "tbank") and 0 < p <= 300:
         return p * 10.0
     return p
 
@@ -673,7 +678,27 @@ def fetch_price_quote(
     if provider == "yfinance":
         if symbol in COINGECKO_IDS and "-" not in symbol:
             symbol = f"{symbol}-USD"
-        return _price_yfinance(symbol)
+        t_up = (ticker or "").upper().strip()
+        preferred_alts = [
+            (alt or "").strip()
+            for alt in _HISTORICAL_SYMBOL_FALLBACKS.get(t_up, [])
+            if (alt or "").strip()
+        ]
+        # If ticker is known delisted, avoid querying the delisted symbol first (noise in logs).
+        if preferred_alts and symbol.upper().strip() == t_up:
+            for alt_symbol in preferred_alts:
+                alt_q = _price_yfinance(alt_symbol)
+                if alt_q.price is not None:
+                    return alt_q
+        q = _price_yfinance(symbol)
+        if q.price is not None:
+            return q
+        # Delisted ticker fallback for live quotes (e.g. ANSS -> SNPS).
+        for alt_symbol in preferred_alts:
+            alt_q = _price_yfinance(alt_symbol)
+            if alt_q.price is not None:
+                return alt_q
+        return q
     if provider == "moex_iss":
         return _price_moex_iss(symbol)
     if provider == "tbank":
@@ -707,16 +732,31 @@ def fetch_historical_prices_yfinance(symbol: str, date_from: str, date_to: str) 
 
         # yfinance end is exclusive; shift by +1 day
         d_end = (datetime.strptime(date_to, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
-        hist = yf.Ticker(symbol).history(start=date_from, end=d_end, interval="1d", auto_adjust=False)
+        t = yf.Ticker(symbol)
+        hist = t.history(start=date_from, end=d_end, interval="1d", auto_adjust=False)
         ccy = "USD"
         try:
-            info = yf.Ticker(symbol).fast_info
+            info = t.fast_info
             raw = getattr(info, "currency", None) if not isinstance(info, dict) else info.get("currency")
             norm = _normalize_currency_code(raw)
             if norm:
                 ccy = norm
         except Exception:
             pass
+        # Some tickers (recent IPO/listing or symbol changes) return empty if start < first listing date.
+        # Fallback to full history and clip to requested range.
+        if hist is None or hist.empty:
+            try:
+                hist_all = t.history(period="max", interval="1d", auto_adjust=False)
+            except Exception:
+                hist_all = None
+            if hist_all is not None and not hist_all.empty:
+                try:
+                    d0 = datetime.strptime(date_from, "%Y-%m-%d").date()
+                    d1 = datetime.strptime(date_to, "%Y-%m-%d").date()
+                    hist = hist_all[(hist_all.index.date >= d0) & (hist_all.index.date <= d1)]
+                except Exception:
+                    hist = hist_all
         if hist is None or hist.empty:
             return out
         for idx, row in hist.iterrows():
@@ -732,48 +772,149 @@ def fetch_historical_prices_yfinance(symbol: str, date_from: str, date_to: str) 
     return out
 
 
-def fetch_historical_prices_moex(symbol: str, date_from: str, date_to: str) -> Dict[str, PriceQuote]:
+def _fetch_historical_prices_moex_market(
+    security: str,
+    date_from: str,
+    date_to: str,
+    market: str,
+    boards: Tuple[str, ...],
+) -> Dict[str, PriceQuote]:
     out: Dict[str, PriceQuote] = {}
-    sec = symbol.upper().strip()
-    for board in ("TQBR", "TQTF"):
-        url = (
-            f"https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/{board}/securities/{sec}.json"
-            f"?from={date_from}&till={date_to}&iss.meta=off"
-        )
-        try:
-            r = _HTTP.get(url, timeout=12)
-            if not r.ok:
-                continue
-            data = r.json() or {}
-            hist = data.get("history", {})
-            cols = hist.get("columns", [])
-            rows = hist.get("data", [])
-            if not cols or not rows:
-                continue
-            idx_trade_date = cols.index("TRADEDATE") if "TRADEDATE" in cols else -1
-            idx_close = cols.index("CLOSE") if "CLOSE" in cols else -1
-            idx_legal_close = cols.index("LEGALCLOSEPRICE") if "LEGALCLOSEPRICE" in cols else -1
-            idx_waprice = cols.index("WAPRICE") if "WAPRICE" in cols else -1
-            if idx_trade_date < 0:
-                continue
-            for row in rows:
-                day = row[idx_trade_date]
-                if not day:
-                    continue
-                px = None
-                for idx_px in (idx_close, idx_legal_close, idx_waprice):
-                    if idx_px >= 0 and idx_px < len(row) and row[idx_px] is not None:
-                        px = row[idx_px]
-                        break
-                try:
-                    if px is not None:
-                        out[str(day)] = PriceQuote(price=float(px), currency="RUB")
-                except (TypeError, ValueError):
-                    continue
-            if out:
+    sec = security.upper().strip()
+    for board in boards:
+        start = 0
+        board_out: Dict[str, PriceQuote] = {}
+        while True:
+            url = (
+                f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}/securities/{sec}.json"
+                f"?from={date_from}&till={date_to}&iss.meta=off&start={start}"
+            )
+            try:
+                r = _HTTP.get(url, timeout=12)
+                if not r.ok:
+                    break
+                data = r.json() or {}
+                hist = data.get("history", {})
+                cols = hist.get("columns", [])
+                rows = hist.get("data", [])
+                if not cols:
+                    break
+                if not rows:
+                    break
+                idx_trade_date = cols.index("TRADEDATE") if "TRADEDATE" in cols else -1
+                idx_close = cols.index("CLOSE") if "CLOSE" in cols else -1
+                idx_legal_close = cols.index("LEGALCLOSEPRICE") if "LEGALCLOSEPRICE" in cols else -1
+                idx_waprice = cols.index("WAPRICE") if "WAPRICE" in cols else -1
+                idx_currency = cols.index("CURRENCYID") if "CURRENCYID" in cols else -1
+                if idx_trade_date < 0:
+                    break
+                for row in rows:
+                    day = row[idx_trade_date]
+                    if not day:
+                        continue
+                    px = None
+                    for idx_px in (idx_close, idx_legal_close, idx_waprice):
+                        if idx_px >= 0 and idx_px < len(row) and row[idx_px] is not None:
+                            px = row[idx_px]
+                            break
+                    try:
+                        if px is not None:
+                            ccy = "RUB"
+                            if idx_currency >= 0 and idx_currency < len(row) and row[idx_currency]:
+                                norm = _normalize_currency_code(str(row[idx_currency]))
+                                if norm:
+                                    ccy = norm
+                            board_out[str(day)] = PriceQuote(price=float(px), currency=ccy)
+                    except (TypeError, ValueError):
+                        continue
+                # MOEX pages are usually 100 rows; advance until shorter page.
+                if len(rows) < 100:
+                    break
+                start += len(rows)
+            except Exception:
                 break
-        except Exception:
-            continue
+        if board_out:
+            out.update(board_out)
+            break
+    return out
+
+
+def fetch_historical_prices_moex(symbol: str, date_from: str, date_to: str) -> Dict[str, PriceQuote]:
+    """
+    MOEX historical prices:
+    - shares/ETF boards first
+    - then bond boards (for ISIN-like RU/SU bonds and bond tickers)
+    """
+    shares_hist = _fetch_historical_prices_moex_market(
+        security=symbol,
+        date_from=date_from,
+        date_to=date_to,
+        market="shares",
+        boards=("TQBR", "TQTF"),
+    )
+    if shares_hist:
+        return shares_hist
+    bonds_hist = _fetch_historical_prices_moex_market(
+        security=symbol,
+        date_from=date_from,
+        date_to=date_to,
+        market="bonds",
+        boards=("TQCB", "TQOB", "TQOD"),
+    )
+    return bonds_hist
+
+
+def _parse_tbank_quotation(raw: object) -> Optional[float]:
+    """Parse T-Bank Quotation payload: {'units': ..., 'nano': ...}."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        units = float(raw.get("units", 0) or 0)
+        nano = float(raw.get("nano", 0) or 0)
+        return units + nano / 1_000_000_000.0
+    except Exception:
+        return None
+
+
+def fetch_historical_prices_tbank(symbol: str, date_from: str, date_to: str) -> Dict[str, PriceQuote]:
+    """
+    Fetch daily candles from T-Bank MarketDataService/GetCandles.
+    Uses FIGI from provider symbol resolution.
+    """
+    out: Dict[str, PriceQuote] = {}
+    token = _get_tbank_token()
+    if not token:
+        return out
+    resolved = _tbank_find_instrument(symbol)
+    if not resolved:
+        return out
+    figi, ccy = resolved
+    url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # API expects RFC3339 timestamps.
+    payload = {
+        "instrumentId": figi,
+        "from": f"{date_from}T00:00:00Z",
+        "to": f"{date_to}T23:59:59Z",
+        "interval": "CANDLE_INTERVAL_DAY",
+    }
+    try:
+        r = _tbank_post(url, headers=headers, payload=payload, timeout=12)
+        if not r.ok:
+            return out
+        data = r.json() or {}
+        for candle in data.get("candles", []) or []:
+            ts = str(candle.get("time") or "").strip()
+            if len(ts) < 10:
+                continue
+            day = ts[:10]
+            close_q = candle.get("close")
+            px = _parse_tbank_quotation(close_q)
+            if px is None:
+                continue
+            out[day] = PriceQuote(price=float(px), currency=ccy or "RUB")
+    except Exception:
+        return {}
     return out
 
 
@@ -788,22 +929,30 @@ def fetch_historical_prices_coingecko(coin_id: str, date_from: str, date_to: str
         return out
     days = max(1, (d1 - d0).days + 1)
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    try:
-        r = _HTTP.get(url, params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=12)
-        r.raise_for_status()
-        data = r.json() or {}
-        for item in data.get("prices", []):
-            if not isinstance(item, list) or len(item) < 2:
+    for attempt in range(3):
+        try:
+            r = _HTTP.get(url, params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=12)
+            if r.status_code == 429:
+                time.sleep(1.0 * (attempt + 1))
                 continue
-            ts_ms, px = item[0], item[1]
-            try:
-                day = datetime.utcfromtimestamp(float(ts_ms) / 1000.0).date()
-                if d0 <= day <= d1:
-                    out[day.isoformat()] = PriceQuote(price=float(px), currency="USD")
-            except (TypeError, ValueError, OSError):
+            r.raise_for_status()
+            data = r.json() or {}
+            for item in data.get("prices", []):
+                if not isinstance(item, list) or len(item) < 2:
+                    continue
+                ts_ms, px = item[0], item[1]
+                try:
+                    day = datetime.utcfromtimestamp(float(ts_ms) / 1000.0).date()
+                    if d0 <= day <= d1:
+                        out[day.isoformat()] = PriceQuote(price=float(px), currency="USD")
+                except (TypeError, ValueError, OSError):
+                    continue
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
                 continue
-    except Exception:
-        return out
+            return out
     return out
 
 
@@ -824,17 +973,38 @@ def fetch_historical_quotes(
     if provider == "moex_iss":
         return fetch_historical_prices_moex(symbol, date_from, date_to)
     if provider == "tbank":
-        # Do not fallback to Yahoo for explicitly configured T-Bank instruments.
-        # Most T-Bank exchange symbols are MOEX-traded; try MOEX history first.
+        # Prefer T-Bank candles, fallback to MOEX history by symbol.
+        tbank_hist = fetch_historical_prices_tbank(symbol, date_from, date_to)
+        if tbank_hist:
+            return tbank_hist
         moex_hist = fetch_historical_prices_moex(symbol, date_from, date_to)
         if moex_hist:
             return moex_hist
         return {}
     if provider == "coingecko":
-        return fetch_historical_prices_coingecko(symbol, date_from, date_to)
+        cg = fetch_historical_prices_coingecko(symbol, date_from, date_to)
+        if cg:
+            return cg
+        # Fallback for throttled CoinGecko: try Yahoo crypto pair.
+        ticker_up = ticker.upper().strip()
+        if ticker_up in COINGECKO_IDS:
+            return fetch_historical_prices_yfinance(f"{ticker_up}-USD", date_from, date_to)
+        return {}
     if provider == "yfinance":
         yf_symbol = f"{symbol}-USD" if symbol in COINGECKO_IDS and "-" not in symbol else symbol
-        return fetch_historical_prices_yfinance(yf_symbol, date_from, date_to)
+        out = fetch_historical_prices_yfinance(yf_symbol, date_from, date_to)
+        if out:
+            return out
+        # Fallback for delisted symbols that no longer return Yahoo history.
+        t_up = ticker.upper().strip()
+        for alt in _HISTORICAL_SYMBOL_FALLBACKS.get(t_up, []):
+            alt_symbol = (alt or "").strip()
+            if not alt_symbol:
+                continue
+            alt_out = fetch_historical_prices_yfinance(alt_symbol, date_from, date_to)
+            if alt_out:
+                return alt_out
+        return {}
     return fetch_historical_prices_yfinance(symbol, date_from, date_to)
 
 

@@ -1,5 +1,6 @@
 """Курсы валют (к USD) и конвертация для отображения портфеля."""
-from typing import Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -7,6 +8,75 @@ import requests
 _FALLBACK_RUB_PER_USD = 95.0
 _FALLBACK_EUR_PER_USD = 0.92
 _YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+def _iter_dates(date_from: str, date_to: str) -> List[str]:
+    d0 = datetime.strptime(date_from, "%Y-%m-%d").date()
+    d1 = datetime.strptime(date_to, "%Y-%m-%d").date()
+    if d1 < d0:
+        return []
+    return [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
+
+
+def _carry_forward_series(raw: Dict[str, float], days: List[str]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    last: Optional[float] = None
+    for d in days:
+        val = raw.get(d)
+        if val is not None and val > 0:
+            last = float(val)
+            out[d] = float(val)
+            continue
+        if last is not None:
+            out[d] = float(last)
+    return out
+
+
+def get_historical_usd_cross_rates(
+    date_from: str,
+    date_to: str,
+    fallback_rub_per_usd: float,
+    fallback_eur_per_usd: float,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Return per-day USD cross rates for requested interval:
+      - rub_per_usd: RUB for 1 USD
+      - eur_per_usd: EUR for 1 USD
+    Missing market days are filled by carry-forward.
+    """
+    days = _iter_dates(date_from, date_to)
+    if not days:
+        return {}
+
+    # Lazy import to avoid heavy dependency loading unless historical FX is requested.
+    from app.services.prices import fetch_historical_prices_yfinance
+
+    usdrub_raw = fetch_historical_prices_yfinance("USDRUB=X", date_from, date_to)
+    eurusd_raw = fetch_historical_prices_yfinance("EURUSD=X", date_from, date_to)
+    rub_map = _carry_forward_series(
+        {d: float(q.price) for d, q in usdrub_raw.items() if q and q.price is not None},
+        days,
+    )
+    # Yahoo EURUSD is USD per 1 EUR, while app expects EUR per 1 USD.
+    eur_per_usd_raw: Dict[str, float] = {}
+    for d, q in eurusd_raw.items():
+        if q is None or q.price is None:
+            continue
+        px = float(q.price)
+        if px > 0:
+            eur_per_usd_raw[d] = 1.0 / px
+    eur_map = _carry_forward_series(eur_per_usd_raw, days)
+
+    out: Dict[str, Tuple[float, float]] = {}
+    for d in days:
+        rub = float(rub_map.get(d, fallback_rub_per_usd))
+        eur = float(eur_map.get(d, fallback_eur_per_usd))
+        if rub <= 0:
+            rub = float(fallback_rub_per_usd)
+        if eur <= 0:
+            eur = float(fallback_eur_per_usd)
+        out[d] = (rub, eur)
+    return out
 
 
 def _fetch_yahoo_pair_rate(symbol: str) -> Optional[float]:

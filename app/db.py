@@ -361,12 +361,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS historical_quotes (
                 ticker TEXT NOT NULL,
                 quote_date TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                provider_symbol TEXT,
                 price REAL,
                 currency TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                updated_at TEXT DEFAULT (datetime('now','localtime')),
                 PRIMARY KEY (ticker, quote_date)
             );
             CREATE TABLE IF NOT EXISTS cash_flows (
@@ -403,6 +401,41 @@ def init_db():
             conn.execute(
                 "ALTER TABLE transactions ADD COLUMN transaction_type TEXT NOT NULL DEFAULT 'trade'"
             )
+            conn.commit()
+        # historical_quotes: provider/provider_symbol are resolved from instruments, not stored here.
+        hq_cols = {
+            str(r["name"]).lower()
+            for r in conn.execute("PRAGMA table_info(historical_quotes)").fetchall()
+        }
+        if "provider" in hq_cols or "provider_symbol" in hq_cols:
+            conn.execute("ALTER TABLE historical_quotes RENAME TO historical_quotes_old")
+            conn.execute(
+                """
+                CREATE TABLE historical_quotes (
+                    ticker TEXT NOT NULL,
+                    quote_date TEXT NOT NULL,
+                    price REAL,
+                    currency TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT DEFAULT (datetime('now','localtime')),
+                    PRIMARY KEY (ticker, quote_date)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO historical_quotes (ticker, quote_date, price, currency, created_at, updated_at)
+                SELECT ticker,
+                       quote_date,
+                       price,
+                       currency,
+                       MIN(COALESCE(created_at, datetime('now','localtime'))) AS created_at,
+                       MAX(COALESCE(updated_at, datetime('now','localtime'))) AS updated_at
+                FROM historical_quotes_old
+                GROUP BY ticker, quote_date
+                """
+            )
+            conn.execute("DROP TABLE historical_quotes_old")
             conn.commit()
         # instruments.asset_subclass_id — подкласс по тикеру (настройка пользователя)
         try:
@@ -1533,16 +1566,14 @@ def upsert_historical_quote(
     try:
         conn.execute(
             """INSERT INTO historical_quotes (
-                   ticker, quote_date, provider, provider_symbol, price, currency, updated_at
+                   ticker, quote_date, price, currency, updated_at
                )
-               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               VALUES (?, ?, ?, ?, datetime('now','localtime'))
                ON CONFLICT(ticker, quote_date) DO UPDATE SET
-                   provider = excluded.provider,
-                   provider_symbol = excluded.provider_symbol,
                    price = excluded.price,
                    currency = excluded.currency,
-                   updated_at = datetime('now')""",
-            (t, quote_date, provider, provider_symbol or "", price, currency.upper()),
+                   updated_at = datetime('now','localtime')""",
+            (t, quote_date, price, currency.upper()),
         )
         conn.commit()
     finally:
@@ -1552,34 +1583,39 @@ def upsert_historical_quote(
 def upsert_historical_quotes_bulk(rows: List[tuple]) -> None:
     """
     Bulk upsert historical quotes.
-    Row format: (ticker, quote_date, provider, provider_symbol, price, currency)
+    Row format (new): (ticker, quote_date, price, currency)
+    Backward-compatible old row format: (ticker, quote_date, provider, provider_symbol, price, currency)
     """
     if not rows:
         return
+    normalized_rows = []
+    for row in rows:
+        if len(row) == 4:
+            t, d, pr, c = row
+        elif len(row) == 6:
+            t, d, _provider, _provider_symbol, pr, c = row
+        else:
+            raise ValueError("invalid historical quote row format")
+        normalized_rows.append(
+            (
+                str(t).strip().upper(),
+                str(d),
+                (None if pr is None else float(pr)),
+                str(c).upper(),
+            )
+        )
     conn = get_conn()
     try:
         conn.executemany(
             """INSERT INTO historical_quotes (
-                   ticker, quote_date, provider, provider_symbol, price, currency, updated_at
+                   ticker, quote_date, price, currency, updated_at
                )
-               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               VALUES (?, ?, ?, ?, datetime('now','localtime'))
                ON CONFLICT(ticker, quote_date) DO UPDATE SET
-                   provider = excluded.provider,
-                   provider_symbol = excluded.provider_symbol,
                    price = excluded.price,
                    currency = excluded.currency,
-                   updated_at = datetime('now')""",
-            [
-                (
-                    str(t).strip().upper(),
-                    str(d),
-                    str(p),
-                    (ps or ""),
-                    (None if pr is None else float(pr)),
-                    str(c).upper(),
-                )
-                for t, d, p, ps, pr, c in rows
-            ],
+                   updated_at = datetime('now','localtime')""",
+            normalized_rows,
         )
         conn.commit()
     finally:
@@ -1593,12 +1629,12 @@ def list_cached_historical_quotes(
 ) -> List[tuple]:
     """
     Return cached historical quotes for ticker in inclusive date range.
-    Output rows: (quote_date, price, currency, provider, provider_symbol)
+    Output rows: (quote_date, price, currency)
     """
     conn = get_conn()
     try:
         rows = conn.execute(
-            """SELECT quote_date, price, currency, provider, provider_symbol
+            """SELECT quote_date, price, currency
                FROM historical_quotes
                WHERE ticker = ? AND quote_date >= ? AND quote_date <= ?
                ORDER BY quote_date""",
@@ -1609,8 +1645,6 @@ def list_cached_historical_quotes(
                 str(r["quote_date"]),
                 (None if r["price"] is None else float(r["price"])),
                 str(r["currency"]).upper(),
-                str(r["provider"]),
-                (r["provider_symbol"] or ""),
             )
             for r in rows
         ]

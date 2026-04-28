@@ -21,9 +21,10 @@ from app.ui.ticker_subclasses import render_ticker_subclasses
 from app.ui.positions import render_add_position, render_remove_position, render_transfer_position
 from app.ui.currency_sidebar import render_currency_sidebar
 from app.ui.rebalancing import render_rebalancing
-from app.ui.performance import render_performance
+from app.ui.performance import render_performance, render_performance_top_metrics
 from app.ui.diversification import render_diversification
 from app.ui.cash_flows import render_cash_flows
+from app.services.performance import refresh_today_historical_quotes
 
 st.set_page_config(page_title="Портфель", layout="wide")
 
@@ -33,6 +34,10 @@ init_db()
 seed_asset_classes_if_empty()
 apply_default_target_percentages_if_unset()
 reconcile_asset_class_targets()
+
+if not bool(st.session_state.get("historical_quotes_today_refreshed_once", False)):
+    refresh_today_historical_quotes()
+    st.session_state["historical_quotes_today_refreshed_once"] = True
 
 # Sidebar: FX + display currency, then actions
 with st.sidebar:
@@ -59,6 +64,7 @@ with st.sidebar:
 
 st.title("Портфель")
 render_portfolio_total_metric()
+render_performance_top_metrics()
 # Main: portfolio summary, storage breakdown, transactions, rebalancing and performance
 tab_summary, tab_diversification, tab_storage, tab_tx, tab_cash, tab_rebalance, tab_performance = st.tabs(
     [
