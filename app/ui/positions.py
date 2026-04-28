@@ -7,6 +7,7 @@ from app.db import (
     list_positions,
     list_storages,
     add_transaction,
+    add_transfer_transaction,
     add_storage,
     get_asset_subclass_for_ticker,
     get_default_storage_id,
@@ -179,3 +180,72 @@ def render_remove_position():
                 f"Продажа {chosen_ticker} ({chosen.storage_name}): −{disp} записана."
             )
             st.rerun()
+
+
+def render_transfer_position():
+    """Перевод: перемещение количества между местами хранения (две записи transfer)."""
+    positions = list_positions()
+    if not positions:
+        st.info("Нет позиций для перевода.")
+        return
+
+    def _pos_label(i: int) -> str:
+        p = positions[i]
+        crypto_p = is_crypto_ticker(p.ticker)
+        qty_disp = p.amount if crypto_p else int(round(p.amount))
+        return f"{p.ticker} — {p.storage_name} ({qty_disp})"
+
+    from_idx = st.selectbox(
+        "Откуда (тикер и место хранения)",
+        options=list(range(len(positions))),
+        format_func=_pos_label,
+        key="transfer_from_idx",
+    )
+    source = positions[from_idx]
+    source_ticker = source.ticker
+    source_max = float(source.amount)
+    is_crypto = is_crypto_ticker(source_ticker)
+
+    storages = [s for s in list_storages() if int(s.id) != int(source.storage_id)]
+    if not storages:
+        st.info("Нет второго места хранения для перевода.")
+        return
+
+    to_storage_id = st.selectbox(
+        "Куда",
+        options=[int(s.id) for s in storages],
+        format_func=lambda sid: next((s.name for s in storages if int(s.id) == int(sid)), str(sid)),
+        key="transfer_to_storage_id",
+    )
+    to_storage_name = next((s.name for s in storages if int(s.id) == int(to_storage_id)), "—")
+
+    transfer_amount = st.number_input(
+        "Количество",
+        min_value=0.0,
+        max_value=source_max,
+        value=min(0.0001 if is_crypto else 1.0, source_max) if source_max > 0 else 0.0,
+        step=0.00000001 if is_crypto else 1.0,
+        format="%.8f" if is_crypto else "%.0f",
+        key=f"transfer_qty_{source_ticker}_{source.storage_id}_{int(is_crypto)}",
+    )
+    if st.button("Перевести", key="transfer_btn"):
+        if transfer_amount <= 0:
+            st.error("Укажите количество больше нуля.")
+            return
+        qty = normalize_quantity(source_ticker, float(transfer_amount))
+        if qty > source_max:
+            st.error("Количество перевода больше доступного остатка.")
+            return
+        subclass_id = get_asset_subclass_for_ticker(source_ticker)
+        add_transfer_transaction(
+            source_ticker,
+            qty,
+            subclass_id,
+            int(source.storage_id),
+            int(to_storage_id),
+        )
+        disp = qty if is_crypto else int(qty)
+        st.success(
+            f"Перевод {source_ticker}: {disp} из {source.storage_name} в {to_storage_name} записан."
+        )
+        st.rerun()

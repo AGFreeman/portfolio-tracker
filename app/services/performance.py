@@ -7,13 +7,17 @@ from datetime import date, datetime, timedelta
 from typing import Dict, List, Mapping, Optional, Tuple
 
 from app.db import (
-    get_instrument_provider,
     list_transactions,
     list_cached_historical_quotes,
     upsert_historical_quotes_bulk,
 )
 from app.services.fx import convert_amount
-from app.services.prices import PriceQuote, fetch_historical_quotes
+from app.services.prices import (
+    PriceQuote,
+    fetch_historical_quotes,
+    build_provider_overrides,
+    normalize_quote_price_for_valuation,
+)
 
 
 @dataclass
@@ -73,16 +77,26 @@ def _load_price_series_with_cache(
     date_to: str,
     provider: str,
     provider_symbol: str,
+    allow_fetch_missing: bool = True,
 ) -> Dict[str, PriceQuote]:
     cached_rows = list_cached_historical_quotes(ticker, date_from, date_to)
-    series: Dict[str, PriceQuote] = {
-        d: PriceQuote(price=p, currency=ccy)
-        for d, p, ccy, _prov, _sym in cached_rows
-    }
+    requested_provider = (provider or "").strip().lower()
+    requested_symbol = (provider_symbol or "").strip().upper()
+    series: Dict[str, PriceQuote] = {}
+    mismatched_days = set()
+    for d, p, ccy, row_provider, row_symbol in cached_rows:
+        row_provider_norm = str(row_provider or "").strip().lower()
+        row_symbol_norm = str(row_symbol or "").strip().upper()
+        provider_matches = row_provider_norm == requested_provider
+        symbol_matches = (not requested_symbol) or (row_symbol_norm == requested_symbol)
+        if provider_matches and symbol_matches:
+            series[d] = PriceQuote(price=p, currency=ccy)
+        else:
+            mismatched_days.add(d)
     requested_days = set(_iter_dates(date_from, date_to))
     missing_days = sorted(d for d in requested_days if d not in series)
 
-    if missing_days:
+    if (missing_days or mismatched_days) and allow_fetch_missing:
         fetched = fetch_historical_quotes(
             ticker=ticker,
             date_from=date_from,
@@ -117,6 +131,7 @@ def compute_portfolio_performance(
     display_currency: str,
     rub_per_usd: float,
     eur_per_usd: float,
+    allow_fetch_missing_prices: bool = True,
 ) -> PerformanceResult:
     tx_by_day, first_tx_date, last_tx_date = _load_daily_transactions()
     if not first_tx_date:
@@ -134,11 +149,7 @@ def compute_portfolio_performance(
     end = date.today().isoformat()
     days = _iter_dates(start, end)
     all_tickers = sorted({t for day_rows in tx_by_day.values() for t, _ in day_rows})
-    provider_overrides: Dict[str, Tuple[str, str]] = {}
-    for t in all_tickers:
-        row = get_instrument_provider(t)
-        if row:
-            provider_overrides[t] = (row[0], (row[1] or "").strip() or t)
+    provider_overrides: Dict[str, Tuple[str, str]] = build_provider_overrides(all_tickers)
 
     prices_by_ticker: Dict[str, Dict[str, PriceQuote]] = {}
     missing_price_tickers: List[str] = []
@@ -149,7 +160,14 @@ def compute_portfolio_performance(
             from app.services.prices import _detect_provider
 
             prov, sym = _detect_provider(t)
-        raw = _load_price_series_with_cache(t, start, end, prov, sym)
+        raw = _load_price_series_with_cache(
+            t,
+            start,
+            end,
+            prov,
+            sym,
+            allow_fetch_missing=allow_fetch_missing_prices,
+        )
         carried = _carry_forward_prices(raw, days)
         prices_by_ticker[t] = carried
         if not carried:
@@ -170,8 +188,11 @@ def compute_portfolio_performance(
             q = prices_by_ticker.get(ticker, {}).get(d)
             if q is None or q.price is None:
                 continue
+            q_price = normalize_quote_price_for_valuation(ticker, q.price, q.currency)
+            if q_price is None:
+                continue
             trade_value = convert_amount(
-                amount=float(amount) * float(q.price),
+                amount=float(amount) * float(q_price),
                 from_ccy=q.currency,
                 to_ccy=display_currency,
                 rub_per_usd=rub_per_usd,
@@ -192,8 +213,11 @@ def compute_portfolio_performance(
             q = prices_by_ticker.get(ticker, {}).get(d)
             if q is None or q.price is None:
                 continue
+            q_price = normalize_quote_price_for_valuation(ticker, q.price, q.currency)
+            if q_price is None:
+                continue
             total_value += convert_amount(
-                amount=float(amount) * float(q.price),
+                amount=float(amount) * float(q_price),
                 from_ccy=q.currency,
                 to_ccy=display_currency,
                 rub_per_usd=rub_per_usd,

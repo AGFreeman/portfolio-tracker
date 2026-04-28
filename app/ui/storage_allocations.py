@@ -4,12 +4,10 @@ from datetime import timedelta
 
 import streamlit as st
 
-from app.db import list_positions, list_storages, get_instrument_provider
+from app.db import list_positions, list_storages
 from app.services.fx import convert_amount, format_money
 from app.services.price_currency import infer_quote_currency
-from app.services.prices import get_quotes_cached, is_crypto_ticker
-
-PRICES_REFRESH_SEC = 60
+from app.services.prices import get_app_quotes, is_crypto_ticker, normalize_quote_price_for_valuation
 
 
 def _fmt_qty(ticker: str, amount: float):
@@ -23,7 +21,7 @@ def _storage_column_names() -> list[str]:
     return [s.name for s in list_storages() if (s.name or "").strip()]
 
 
-@st.fragment(run_every=timedelta(seconds=PRICES_REFRESH_SEC))
+@st.fragment()
 def render_storage_allocations_fragment():
     positions = list_positions()
     if not positions:
@@ -53,16 +51,8 @@ def render_storage_allocations_fragment():
         qty_by_ticker_place[p.ticker][place] += float(p.amount)
 
     tickers_sorted = sorted(qty_by_ticker_place.keys())
-    provider_overrides = {}
-    for t in tickers_sorted:
-        prov = get_instrument_provider(t)
-        if prov:
-            provider_overrides[t] = prov
-    quotes = get_quotes_cached(
-        tickers_sorted,
-        cache_ttl_sec=PRICES_REFRESH_SEC,
-        provider_overrides=provider_overrides,
-    )
+    live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
+    quotes = get_app_quotes(tickers_sorted)
 
     rows: list[dict] = []
     for ticker in tickers_sorted:
@@ -71,15 +61,17 @@ def render_storage_allocations_fragment():
         for place in place_columns:
             amt = qty_by_ticker_place[ticker].get(place, 0.0)
             total += amt
+            # Все ячейки — строки: иначе Arrow ругается на object-колонку с int и «—».
             if amt == 0:
                 row[place] = "—"
             else:
-                row[place] = _fmt_qty(ticker, amt)
-        row["Всего"] = _fmt_qty(ticker, total)
+                row[place] = str(_fmt_qty(ticker, amt))
+        row["Всего"] = str(_fmt_qty(ticker, total))
 
         q = quotes.get(ticker)
-        price = q.price if q else None
+        raw_price = q.price if q else None
         quote_ccy = q.currency if q else infer_quote_currency(ticker)
+        price = normalize_quote_price_for_valuation(ticker, raw_price, quote_ccy)
         if price is not None:
             price_disp = convert_amount(price, quote_ccy, display_ccy, rub, eur)
             row["Цена"] = format_money(price_disp, display_ccy)
@@ -90,11 +82,12 @@ def render_storage_allocations_fragment():
 
     st.caption(
         f"По каждому тикеру — **одна строка**; столбцы — остатки по местам из справочника, затем **Всего** и **Цена** "
-        f"({display_ccy} за единицу). Обновление котировок ~каждые **{PRICES_REFRESH_SEC} с**."
+        f"({display_ccy} за единицу). "
+        f"{'Автообновление котировок включено.' if live_updates_enabled else 'Автообновление котировок отключено.'}"
     )
     st.dataframe(
         rows,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         key="storage_allocations_df",
     )

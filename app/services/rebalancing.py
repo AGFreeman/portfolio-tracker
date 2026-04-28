@@ -196,23 +196,62 @@ def compute_rebalance_plan(
             )
             continue
         alloc = split_subclass_budget_to_tickers(bud, tlist)
+        entry_rows = []
         for tkr, spend in alloc.items():
             r = by_ticker.get(tkr.upper())
             if r is None or r.price_display is None:
                 continue
             price = float(r.price_display)
             units, implied = units_and_implied_spend(tkr, spend, price)
-            if units <= 0 and spend > 0:
+            entry_rows.append(
+                {
+                    "ticker": tkr,
+                    "spend_allocated": float(spend),
+                    "price": price,
+                    "units": float(units),
+                    "implied": float(implied),
+                    "is_crypto": bool(is_crypto_ticker(tkr)),
+                }
+            )
+
+        # Minimize unsettled cash: spend residual subclass budget on extra units where possible.
+        implied_sum = sum(float(e["implied"]) for e in entry_rows)
+        residual_sub = max(0.0, float(bud) - implied_sum)
+        if residual_sub > 1e-12 and entry_rows:
+            crypto_entries = [e for e in entry_rows if bool(e["is_crypto"]) and float(e["price"]) > 0]
+            if crypto_entries:
+                target = max(crypto_entries, key=lambda e: float(e["spend_allocated"]))
+                p = float(target["price"])
+                extra_units = math.floor((residual_sub / p) * 1e8) / 1e8
+                if extra_units > 0:
+                    extra_spend = extra_units * p
+                    target["units"] = float(target["units"]) + float(extra_units)
+                    target["implied"] = float(target["implied"]) + float(extra_spend)
+                    residual_sub = max(0.0, residual_sub - float(extra_spend))
+
+            stock_entries = [e for e in entry_rows if (not bool(e["is_crypto"])) and float(e["price"]) > 0]
+            if stock_entries and residual_sub > 1e-12:
+                cheapest = min(stock_entries, key=lambda e: float(e["price"]))
+                cp = float(cheapest["price"])
+                extra_lots = int(math.floor(residual_sub / cp))
+                if extra_lots > 0:
+                    extra_spend = float(extra_lots) * cp
+                    cheapest["units"] = float(cheapest["units"]) + float(extra_lots)
+                    cheapest["implied"] = float(cheapest["implied"]) + float(extra_spend)
+                    residual_sub = max(0.0, residual_sub - float(extra_spend))
+
+        for e in entry_rows:
+            if float(e["units"]) <= 0 and float(e["spend_allocated"]) > 0:
                 continue
             plan.suggested_buys.append(
                 SuggestedBuy(
-                    ticker=tkr,
+                    ticker=str(e["ticker"]),
                     asset_subclass_id=sid,
                     subclass_name=name,
-                    spend_allocated=spend,
-                    units=units,
-                    implied_spend=implied,
-                    price_display=price,
+                    spend_allocated=float(e["spend_allocated"]),
+                    units=float(e["units"]),
+                    implied_spend=float(e["implied"]),
+                    price_display=float(e["price"]),
                 )
             )
 

@@ -10,11 +10,6 @@ import streamlit as st
 from app.db import (
     init_db,
     seed_asset_classes_if_empty,
-    apply_allocation_user_sheet_migration,
-    apply_tovary_broker_subclass_names_migration,
-    apply_zoloto_broker_parens_subclass_migration,
-    apply_crypto_subclass_canonical_migration,
-    apply_crypto_two_subclasses_migration,
     apply_default_target_percentages_if_unset,
     reconcile_asset_class_targets,
 )
@@ -23,21 +18,19 @@ from app.ui.storage_allocations import render_storage_allocations
 from app.ui.transactions import render_transactions_table
 from app.ui.asset_classes import render_asset_classes
 from app.ui.ticker_subclasses import render_ticker_subclasses
-from app.ui.positions import render_add_position, render_remove_position
+from app.ui.positions import render_add_position, render_remove_position, render_transfer_position
 from app.ui.currency_sidebar import render_currency_sidebar
 from app.ui.rebalancing import render_rebalancing
 from app.ui.performance import render_performance
+from app.ui.diversification import render_diversification
+from app.ui.cash_flows import render_cash_flows
 
 st.set_page_config(page_title="Портфель", layout="wide")
 
-# Миграции БД при каждом прогоне (иначе после обновления кода без новой сессии схема остаётся старой)
+# Базовая инициализация БД без автоприменения миграций:
+# на этапе активной разработки структура и данные поддерживаются вручную.
 init_db()
 seed_asset_classes_if_empty()
-apply_allocation_user_sheet_migration()
-apply_tovary_broker_subclass_names_migration()
-apply_zoloto_broker_parens_subclass_migration()
-apply_crypto_subclass_canonical_migration()
-apply_crypto_two_subclasses_migration()
 apply_default_target_percentages_if_unset()
 reconcile_asset_class_targets()
 
@@ -50,13 +43,15 @@ with st.sidebar:
         "В **Покупке** место выбирается как тикер (список из базы + «Новое место…»). "
         "Разбивка по счетам — вкладка **«По местам хранения»**; в «Транзакциях» — колонка **Место хранения**."
     )
-    add_tab, remove_tab, ticker_tab, classes_tab = st.tabs(
-        ["Покупка", "Продажа", "Тикеры и классы", "Классы активов"]
+    add_tab, remove_tab, transfer_tab, ticker_tab, classes_tab = st.tabs(
+        ["Покупка", "Продажа", "Перевод", "Тикеры и классы", "Классы активов"]
     )
     with add_tab:
         render_add_position()
     with remove_tab:
         render_remove_position()
+    with transfer_tab:
+        render_transfer_position()
     with ticker_tab:
         render_ticker_subclasses()
     with classes_tab:
@@ -65,16 +60,30 @@ with st.sidebar:
 st.title("Портфель")
 render_portfolio_total_metric()
 # Main: portfolio summary, storage breakdown, transactions, rebalancing and performance
-tab_summary, tab_storage, tab_tx, tab_rebalance, tab_performance = st.tabs(
-    ["Сводка портфеля", "По местам хранения", "Транзакции", "Ребалансировка", "Доходность"]
+tab_summary, tab_diversification, tab_storage, tab_tx, tab_cash, tab_rebalance, tab_performance = st.tabs(
+    [
+        "Сводка портфеля",
+        "Диверсификация",
+        "По местам хранения",
+        "Транзакции",
+        "Деньги",
+        "Ребалансировка",
+        "Доходность",
+    ]
 )
 with tab_summary:
     render_portfolio_table()
+with tab_diversification:
+    render_diversification()
 with tab_storage:
     render_storage_allocations()
 with tab_tx:
-    st.caption("Все покупки и продажи по дате (новые сверху).")
+    st.caption(
+        "Все операции по дате: покупки, продажи, погашения облигаций, переводы и сплиты (новые сверху)."
+    )
     render_transactions_table()
+with tab_cash:
+    render_cash_flows()
 with tab_rebalance:
     render_rebalancing()
 with tab_performance:

@@ -46,10 +46,20 @@ class Transaction:
     ticker: str
     amount: float  # positive = buy, negative = sell
     asset_subclass_id: int
-    currency: Optional[str] = None
+    transaction_type: str = "trade"  # trade | transfer | split | bond_redemption | conversion_blocked
     created_at: Optional[str] = None
     storage_id: int = 0
     storage_name: Optional[str] = None
+
+
+@dataclass
+class CashFlow:
+    """Ручной учёт ввода/вывода денег (не сделки по тикерам)."""
+
+    id: int
+    amount: float
+    currency: str
+    flow_date: str
 
 
 @dataclass

@@ -5,9 +5,12 @@ from app.db import (
     list_asset_subclasses,
     list_asset_classes,
     list_distinct_tickers,
+    get_instrument_main_map,
     resolve_asset_subclass_id,
     set_instrument_asset_subclass,
+    set_ticker_main_flag,
 )
+from app.services.prices import request_quotes_refresh
 def render_ticker_subclasses():
     st.caption(
         "Необязательно: переопределить, к какому **подклассу** относится тикер. "
@@ -26,6 +29,7 @@ def render_ticker_subclasses():
     sub_labels = {o[0]: o[1] for o in sub_options}
 
     tickers = list_distinct_tickers()
+    main_map = get_instrument_main_map(tickers) if tickers else {}
     if tickers:
         st.subheader("Тикеры в портфеле и справочнике")
         for t in tickers:
@@ -45,9 +49,17 @@ def render_ticker_subclasses():
                     label_visibility="collapsed",
                 )
             with col3:
-                if st.button("Сохранить", key=f"save_sub_{t}"):
+                is_main = st.checkbox(
+                    "Основной",
+                    value=bool(main_map.get(t.upper(), False)),
+                    key=f"main_pick_{t}",
+                    help="Включить тикер в основной портфель.",
+                )
+                if st.button("Сохранить", key=f"save_ticker_cfg_{t}"):
                     set_instrument_asset_subclass(t, new_sub)
-                    st.success(f"{t}: подкласс сохранён.")
+                    set_ticker_main_flag(t, is_main)
+                    request_quotes_refresh()
+                    st.success(f"{t}: настройки сохранены.")
                     st.rerun()
 
     st.subheader("Добавить тикер заранее")
@@ -61,6 +73,7 @@ def render_ticker_subclasses():
         add_submitted = st.form_submit_button("Сохранить тикер")
         if add_submitted and nt:
             set_instrument_asset_subclass(nt, ns)
+            request_quotes_refresh()
             st.success(f"Тикер {nt} добавлен с выбранным подклассом.")
             st.rerun()
         elif add_submitted and not nt:

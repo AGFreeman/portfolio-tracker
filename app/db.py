@@ -2,11 +2,20 @@
 import os
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
-from app.models import AssetClass, AssetSubclass, Position, Storage, Transaction
+from app.models import (
+    AssetClass,
+    AssetSubclass,
+    CashFlow,
+    Position,
+    Storage,
+    Transaction,
+)
 
 DB_PATH = os.environ.get("PORTFOLIO_DB", str(Path(__file__).resolve().parent.parent / "data" / "portfolio.db"))
+_CASH_FLOWS_TABLE = "cash_flows"
+_LEGACY_CASH_FLOWS_TABLE = "portfolio_cash_flows"
 
 # Начальный список мест хранения (полные названия). Добавляются в БД, если такого имени ещё нет.
 # Ожидаемые суммы по классам (= сумма подклассов ниже); в БД у классов target_pct выставляется только расчётом.
@@ -22,11 +31,9 @@ ASSET_CLASS_DEFAULT_PCT = {
 ASSET_SUBCLASS_DEFAULT_ROWS = [
     ("Акции", "Акции США", 14.880, 1),
     ("Акции", "Акции развитых стран кроме США", 10.230, 2),
-    ("Акции", "Акции Еврозоны", 0.0, 3),
-    ("Акции", "Акции РФ", 12.090, 4),
-    ("Акции", "Акции Китая", 12.090, 5),
-    ("Акции", "Акции развивающихся стран кроме Китая", 6.510, 6),
-    ("Акции", "Акции развивающихся стран", 0.0, 7),
+    ("Акции", "Акции РФ", 12.090, 3),
+    ("Акции", "Акции Китая", 12.090, 4),
+    ("Акции", "Акции развивающихся стран кроме Китая", 6.510, 5),
     ("Недвижимость", "Недвижимость США", 4.650, 1),
     ("Недвижимость", "Весь мир кроме США", 4.650, 2),
     ("Облигации", "Гособлигации США", 4.650, 1),
@@ -52,6 +59,7 @@ DEFAULT_STORAGE_NAMES_ORDERED = [
     "Trust Wallet",
     "Tangem",
 ]
+_PORTFOLIO_TABLE = "portfolio"
 
 
 def _ensure_seed_storages(conn: sqlite3.Connection) -> None:
@@ -94,6 +102,151 @@ def _remove_legacy_default_named_storage(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_portfolio_table(conn: sqlite3.Connection) -> None:
+    """Текущие позиции по паре (тикер, место хранения) + флаги blocked/main."""
+    has_legacy = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'portfolio_instrument_storages' LIMIT 1"
+    ).fetchone()
+    has_portfolio = conn.execute(
+        f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{_PORTFOLIO_TABLE}' LIMIT 1"
+    ).fetchone()
+    if has_legacy and not has_portfolio:
+        conn.execute(f"ALTER TABLE portfolio_instrument_storages RENAME TO {_PORTFOLIO_TABLE}")
+        conn.commit()
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_PORTFOLIO_TABLE} (
+            ticker TEXT NOT NULL,
+            storage_id INTEGER NOT NULL REFERENCES storages(id),
+            blocked INTEGER NOT NULL DEFAULT 0,
+            main INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (ticker, storage_id)
+        )
+        """
+    )
+    conn.commit()
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute(f"PRAGMA table_info({_PORTFOLIO_TABLE})").fetchall()
+    }
+    if "main" not in cols:
+        conn.execute(f"ALTER TABLE {_PORTFOLIO_TABLE} ADD COLUMN main INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+
+def _sync_portfolio_table(conn: sqlite3.Connection) -> None:
+    """Синхронизировать таблицу блокировок со списком текущих позиций (> 0)."""
+    conn.execute(
+        f"""
+        INSERT INTO {_PORTFOLIO_TABLE} (ticker, storage_id, blocked, main)
+        SELECT p.ticker, p.storage_id, 0,
+               COALESCE((SELECT MAX(COALESCE(b2.main, 0))
+                         FROM {_PORTFOLIO_TABLE} b2
+                         WHERE b2.ticker = p.ticker), 0)
+        FROM (
+            SELECT t.ticker AS ticker, t.storage_id AS storage_id, SUM(t.amount) AS total
+            FROM transactions t
+            GROUP BY t.ticker, t.storage_id
+            HAVING total > 0
+        ) p
+        LEFT JOIN {_PORTFOLIO_TABLE} b
+               ON b.ticker = p.ticker AND b.storage_id = p.storage_id
+        WHERE b.ticker IS NULL
+        """
+    )
+    conn.execute(
+        f"""
+        DELETE FROM {_PORTFOLIO_TABLE}
+        WHERE (ticker, storage_id) NOT IN (
+            SELECT t.ticker, t.storage_id
+            FROM transactions t
+            GROUP BY t.ticker, t.storage_id
+            HAVING SUM(t.amount) > 0
+        )
+        """
+    )
+    conn.commit()
+
+
+def _migrate_legacy_ticker_blocks_to_storage(conn: sqlite3.Connection) -> None:
+    """Перенести старые флаги блокировки (в instruments) в таблицу по местам хранения."""
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute("PRAGMA table_info(instruments)").fetchall()
+    }
+    legacy_col = None
+    if "blocked" in cols:
+        legacy_col = "blocked"
+    elif "buy_blocked" in cols:
+        legacy_col = "buy_blocked"
+    if legacy_col is None:
+        return
+    rows = conn.execute(
+        f"SELECT ticker FROM instruments WHERE COALESCE({legacy_col}, 0) = 1 ORDER BY ticker"
+    ).fetchall()
+    for r in rows:
+        ticker = str(r["ticker"]).upper()
+        conn.execute(
+            """
+            UPDATE portfolio
+            SET blocked = 1, updated_at = datetime('now')
+            WHERE ticker = ?
+            """,
+            (ticker,),
+        )
+    conn.commit()
+
+
+def _migrate_legacy_instruments_main_to_portfolio(conn: sqlite3.Connection) -> None:
+    """Перенести старый instruments.main в portfolio.main (по тикеру)."""
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute("PRAGMA table_info(instruments)").fetchall()
+    }
+    if "main" not in cols:
+        return
+    conn.execute(
+        f"""
+        UPDATE {_PORTFOLIO_TABLE}
+        SET main = COALESCE(
+            (
+                SELECT COALESCE(i.main, 0)
+                FROM instruments i
+                WHERE i.ticker = {_PORTFOLIO_TABLE}.ticker
+                LIMIT 1
+            ),
+            main
+        )
+        WHERE ticker IN (
+            SELECT ticker FROM instruments WHERE COALESCE(main, 0) = 1
+        )
+        """
+    )
+    conn.commit()
+
+
+def _drop_legacy_block_columns_from_instruments(conn: sqlite3.Connection) -> None:
+    """Удалить устаревшие колонки блокировок из instruments (blocked/buy_blocked)."""
+    cols = [
+        str(r["name"])
+        for r in conn.execute("PRAGMA table_info(instruments)").fetchall()
+    ]
+    to_drop = [c for c in ("blocked", "buy_blocked") if c in cols]
+    for col in to_drop:
+        try:
+            conn.execute(f"ALTER TABLE instruments DROP COLUMN {col}")
+        except sqlite3.OperationalError:
+            # Older SQLite may not support DROP COLUMN.
+            # In that case we keep legacy column physically, but app logic no longer uses it.
+            continue
+        conn.commit()
+        cols = [
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(instruments)").fetchall()
+        ]
+
+
 def _ensure_data_dir():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
@@ -105,10 +258,76 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _transactions_has_asset_subclass_column(conn: sqlite3.Connection) -> bool:
+    cols = conn.execute("PRAGMA table_info(transactions)").fetchall()
+    return any(str(r["name"]) == "asset_subclass_id" for r in cols)
+
+
+def _instruments_has_asset_subclass_column(conn: sqlite3.Connection) -> bool:
+    cols = conn.execute("PRAGMA table_info(instruments)").fetchall()
+    return any(str(r["name"]) == "asset_subclass_id" for r in cols)
+
+
+def add_cash_flow(amount: float, direction: str, currency: str, flow_date: str) -> int:
+    """Запись о вводе/выводе денег; out хранится как отрицательный amount."""
+    if float(amount) <= 0:
+        raise ValueError("amount must be positive")
+    d = (direction or "").strip().lower()
+    if d not in ("in", "out"):
+        raise ValueError("direction must be 'in' or 'out'")
+    ccy = (currency or "RUB").strip().upper() or "RUB"
+    fd = (flow_date or "").strip()[:10]
+    if len(fd) < 10:
+        raise ValueError("flow_date must be YYYY-MM-DD")
+    conn = get_conn()
+    try:
+        signed_amount = float(amount) if d == "in" else -float(amount)
+        cur = conn.execute(
+            f"""INSERT INTO {_CASH_FLOWS_TABLE} (amount, currency, flow_date)
+               VALUES (?, ?, ?)""",
+            (signed_amount, ccy, fd),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def list_cash_flows() -> List[CashFlow]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            f"""SELECT id, amount, currency, flow_date
+               FROM {_CASH_FLOWS_TABLE}
+               ORDER BY flow_date DESC, id DESC"""
+        ).fetchall()
+        return [
+            CashFlow(
+                int(r["id"]),
+                float(r["amount"]),
+                str(r["currency"]),
+                str(r["flow_date"]),
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def delete_cash_flow(flow_id: int) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(f"DELETE FROM {_CASH_FLOWS_TABLE} WHERE id = ?", (int(flow_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def init_db():
     conn = get_conn()
     try:
-        conn.executescript("""
+        conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS asset_classes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -127,21 +346,11 @@ def init_db():
                 provider TEXT NOT NULL,
                 provider_symbol TEXT
             );
-            CREATE TABLE IF NOT EXISTS positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                amount REAL NOT NULL,
-                asset_subclass_id INTEGER NOT NULL REFERENCES asset_subclasses(id),
-                currency TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            );
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker TEXT NOT NULL,
                 amount REAL NOT NULL,
-                asset_subclass_id INTEGER NOT NULL REFERENCES asset_subclasses(id),
-                currency TEXT,
+                transaction_type TEXT NOT NULL DEFAULT 'trade',
                 created_at TEXT DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS storages (
@@ -160,11 +369,20 @@ def init_db():
                 updated_at TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (ticker, quote_date)
             );
-        """)
+            CREATE TABLE IF NOT EXISTS cash_flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                flow_date TEXT NOT NULL,
+                CHECK (amount != 0)
+            );
+        """
+        )
         conn.commit()
         # Стартовые места хранения (IB, Тинькофф, кошельки…) + колонка storage_id у сделок
         _ensure_seed_storages(conn)
         _remove_legacy_default_named_storage(conn)
+        _ensure_portfolio_table(conn)
         try:
             conn.execute("SELECT storage_id FROM transactions LIMIT 1")
         except sqlite3.OperationalError:
@@ -177,33 +395,104 @@ def init_db():
                 (default_sid,),
             )
             conn.commit()
+        _sync_portfolio_table(conn)
+        # transactions.transaction_type — тип операции: trade | transfer | split | bond_redemption | conversion_blocked
+        try:
+            conn.execute("SELECT transaction_type FROM transactions LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(
+                "ALTER TABLE transactions ADD COLUMN transaction_type TEXT NOT NULL DEFAULT 'trade'"
+            )
+            conn.commit()
         # instruments.asset_subclass_id — подкласс по тикеру (настройка пользователя)
         try:
             conn.execute("SELECT asset_subclass_id FROM instruments LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE instruments ADD COLUMN asset_subclass_id INTEGER")
             conn.commit()
-        # instruments.buy_blocked — тикер запрещён к покупке в ребалансировке
-        try:
-            conn.execute("SELECT buy_blocked FROM instruments LIMIT 1")
-        except sqlite3.OperationalError:
-            conn.execute("ALTER TABLE instruments ADD COLUMN buy_blocked INTEGER NOT NULL DEFAULT 0")
+        _migrate_legacy_ticker_blocks_to_storage(conn)
+        _migrate_legacy_instruments_main_to_portfolio(conn)
+        _drop_legacy_block_columns_from_instruments(conn)
+        # Rename legacy table if it still exists from older schema name.
+        has_legacy_cf = conn.execute(
+            f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{_LEGACY_CASH_FLOWS_TABLE}' LIMIT 1"
+        ).fetchone()
+        has_new_cf = conn.execute(
+            f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{_CASH_FLOWS_TABLE}' LIMIT 1"
+        ).fetchone()
+        if has_legacy_cf and not has_new_cf:
+            conn.execute(f"ALTER TABLE {_LEGACY_CASH_FLOWS_TABLE} RENAME TO {_CASH_FLOWS_TABLE}")
             conn.commit()
-        # Migrate existing positions into transactions (one tx per position)
+        elif has_legacy_cf and has_new_cf:
+            conn.execute(
+                f"""
+                INSERT INTO {_CASH_FLOWS_TABLE} (id, amount, currency, flow_date)
+                SELECT p.id, p.amount, p.currency, p.flow_date
+                FROM {_LEGACY_CASH_FLOWS_TABLE} p
+                LEFT JOIN {_CASH_FLOWS_TABLE} c ON c.id = p.id
+                WHERE c.id IS NULL
+                """
+            )
+            conn.execute(f"DROP TABLE {_LEGACY_CASH_FLOWS_TABLE}")
+            conn.commit()
+
+        # cash_flows: signed amount only (out < 0), drop legacy columns direction/created_at.
+        cf_cols = conn.execute("PRAGMA table_info(cash_flows)").fetchall()
+        cf_col_names = {str(r["name"]) for r in cf_cols}
+        if "direction" in cf_col_names or "created_at" in cf_col_names:
+            conn.execute("ALTER TABLE cash_flows RENAME TO cash_flows_old")
+            conn.execute(
+                """
+                CREATE TABLE cash_flows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    amount REAL NOT NULL,
+                    currency TEXT NOT NULL,
+                    flow_date TEXT NOT NULL,
+                    CHECK (amount != 0)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO cash_flows (id, amount, currency, flow_date)
+                SELECT
+                    id,
+                    CASE
+                        WHEN LOWER(COALESCE(direction, 'in')) = 'out' THEN -ABS(amount)
+                        ELSE ABS(amount)
+                    END AS amount,
+                    currency,
+                    flow_date
+                FROM cash_flows_old
+                WHERE amount IS NOT NULL
+                """
+            )
+            conn.execute("DROP TABLE cash_flows_old")
+            conn.commit()
+        # Migrate legacy positions table into transactions (one tx per position).
+        has_positions = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'positions' LIMIT 1"
+        ).fetchone()
         cur = conn.execute("SELECT COUNT(*) FROM transactions")
-        if cur.fetchone()[0] == 0:
-            cur = conn.execute("SELECT ticker, amount, asset_subclass_id, currency FROM positions")
-            rows = cur.fetchall()
+        if has_positions and cur.fetchone()[0] == 0:
+            rows = conn.execute(
+                "SELECT ticker, amount, asset_subclass_id FROM positions"
+            ).fetchall()
             default_sid_row = conn.execute("SELECT id FROM storages ORDER BY id LIMIT 1").fetchone()
             default_sid = int(default_sid_row[0]) if default_sid_row else 1
             for r in rows:
                 conn.execute(
-                    """INSERT INTO transactions (ticker, amount, asset_subclass_id, currency, storage_id)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (r[0], r[1], r[2], r[3], default_sid),
+                    "UPDATE instruments SET asset_subclass_id = ? WHERE ticker = ?",
+                    (r[2], r[0]),
+                )
+                conn.execute(
+                    """INSERT INTO transactions (ticker, amount, storage_id, transaction_type)
+                       VALUES (?, ?, ?, 'trade')""",
+                    (r[0], r[1], default_sid),
                 )
             if rows:
                 conn.commit()
+        _sync_portfolio_table(conn)
     finally:
         conn.close()
 
@@ -303,6 +592,7 @@ TOVARY_BROKER_SUBCLASS_NAMES_MIGRATION_ID = "subclass_tovary_broker_names_2026"
 ZOLOTO_BROKER_PARENS_MIGRATION_ID = "subclass_zoloto_broker_parens_2026"
 CRYPTO_SUBCLASS_CANONICAL_MIGRATION_ID = "subclass_crypto_canonical_2026"
 CRYPTO_TWO_SUBCLASSES_MIGRATION_ID = "subclass_crypto_two_subclasses_2026"
+REMOVE_LEGACY_EQUITY_SUBCLASSES_MIGRATION_ID = "subclass_remove_legacy_equity_2026"
 
 
 def _normalize_tovary_zoloto_broker_subclass_names_in_conn(conn: sqlite3.Connection) -> None:
@@ -680,6 +970,112 @@ def apply_crypto_two_subclasses_migration() -> None:
         conn.close()
 
 
+def apply_remove_legacy_equity_subclasses_migration() -> None:
+    """
+    Однократно: убрать подклассы акций, которые больше не используются:
+    - «Акции Еврозоны»
+    - «Акции развивающихся стран»
+    Их ссылки и целевая доля переносятся в «Акции развивающихся стран кроме Китая».
+    """
+    conn = get_conn()
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations (id TEXT PRIMARY KEY)"
+        )
+        if conn.execute(
+            "SELECT 1 FROM _schema_migrations WHERE id = ?",
+            (REMOVE_LEGACY_EQUITY_SUBCLASSES_MIGRATION_ID,),
+        ).fetchone():
+            return
+
+        eq_cls = conn.execute(
+            "SELECT id FROM asset_classes WHERE name = 'Акции' LIMIT 1"
+        ).fetchone()
+        if eq_cls is None:
+            conn.execute(
+                "INSERT INTO _schema_migrations (id) VALUES (?)",
+                (REMOVE_LEGACY_EQUITY_SUBCLASSES_MIGRATION_ID,),
+            )
+            conn.commit()
+            return
+
+        equity_class_id = int(eq_cls["id"])
+        keep_name = "Акции развивающихся стран кроме Китая"
+        keep_row = conn.execute(
+            "SELECT id, target_pct FROM asset_subclasses WHERE asset_class_id = ? AND name = ? LIMIT 1",
+            (equity_class_id, keep_name),
+        ).fetchone()
+        if keep_row is None:
+            inserted = conn.execute(
+                """INSERT INTO asset_subclasses (asset_class_id, name, target_pct, sort_order)
+                   VALUES (?, ?, ?, ?)""",
+                (equity_class_id, keep_name, 6.510, 5),
+            )
+            keep_id = int(inserted.lastrowid)
+            keep_pct = 6.510
+        else:
+            keep_id = int(keep_row["id"])
+            keep_pct = float(keep_row["target_pct"] or 0.0)
+
+        remove_names = ("Акции Еврозоны", "Акции развивающихся стран")
+        removed_rows = conn.execute(
+            """SELECT id, target_pct
+               FROM asset_subclasses
+               WHERE asset_class_id = ?
+                 AND name IN (?, ?)
+               ORDER BY id""",
+            (equity_class_id, *remove_names),
+        ).fetchall()
+        remove_ids = [int(r["id"]) for r in removed_rows if int(r["id"]) != keep_id]
+        moved_pct = sum(
+            float(r["target_pct"] or 0.0)
+            for r in removed_rows
+            if int(r["id"]) != keep_id
+        )
+
+        if remove_ids:
+            q_marks = ",".join("?" for _ in remove_ids)
+            conn.execute(
+                f"UPDATE transactions SET asset_subclass_id = ? WHERE asset_subclass_id IN ({q_marks})",
+                (keep_id, *remove_ids),
+            )
+            conn.execute(
+                f"UPDATE instruments SET asset_subclass_id = ? WHERE asset_subclass_id IN ({q_marks})",
+                (keep_id, *remove_ids),
+            )
+            conn.execute(
+                f"DELETE FROM asset_subclasses WHERE id IN ({q_marks})",
+                tuple(remove_ids),
+            )
+            conn.execute(
+                "UPDATE asset_subclasses SET target_pct = ROUND(?, 3) WHERE id = ?",
+                (keep_pct + moved_pct, keep_id),
+            )
+
+        for name, sort_order in (
+            ("Акции США", 1),
+            ("Акции развитых стран кроме США", 2),
+            ("Акции РФ", 3),
+            ("Акции Китая", 4),
+            ("Акции развивающихся стран кроме Китая", 5),
+        ):
+            conn.execute(
+                """UPDATE asset_subclasses
+                   SET sort_order = ?
+                   WHERE asset_class_id = ? AND name = ?""",
+                (sort_order, equity_class_id, name),
+            )
+
+        _reconcile_asset_class_targets_in_conn(conn)
+        conn.execute(
+            "INSERT INTO _schema_migrations (id) VALUES (?)",
+            (REMOVE_LEGACY_EQUITY_SUBCLASSES_MIGRATION_ID,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def apply_allocation_user_sheet_migration() -> None:
     """
     Однократно: переименования, новые подклассы, целевые % по таблице пользователя.
@@ -779,10 +1175,13 @@ def update_asset_subclass_target(subclass_id: int, target_pct: float):
 # --- Instruments (provider mapping) ---
 def get_instrument_provider(ticker: str) -> Optional[tuple]:
     """Returns (provider, provider_symbol) or None if not set."""
+    t = (ticker or "").upper().strip()
+    if not t:
+        return None
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT provider, provider_symbol FROM instruments WHERE ticker = ?", (ticker.upper(),)
+            "SELECT provider, provider_symbol FROM instruments WHERE ticker = ?", (t,)
         ).fetchone()
         if row:
             return (row["provider"], row["provider_symbol"])
@@ -792,12 +1191,15 @@ def get_instrument_provider(ticker: str) -> Optional[tuple]:
 
 
 def set_instrument_provider(ticker: str, provider: str, provider_symbol: Optional[str] = None):
+    t = (ticker or "").upper().strip()
+    if not t:
+        return
     conn = get_conn()
     try:
         conn.execute(
             """INSERT INTO instruments (ticker, provider, provider_symbol)
                VALUES (?, ?, ?) ON CONFLICT(ticker) DO UPDATE SET provider=excluded.provider, provider_symbol=excluded.provider_symbol""",
-            (ticker.upper(), provider, provider_symbol or ""),
+            (t, provider, provider_symbol or ""),
         )
         conn.commit()
     finally:
@@ -815,6 +1217,54 @@ def get_instrument_asset_subclass(ticker: str) -> Optional[int]:
         if row and row["asset_subclass_id"] is not None:
             return int(row["asset_subclass_id"])
         return None
+    finally:
+        conn.close()
+
+
+def get_instrument_main_map(tickers: Sequence[str]) -> Dict[str, bool]:
+    """
+    Вернуть признак portfolio.main по набору тикеров.
+    Для отсутствующих строк — False.
+    """
+    uniq = sorted({(t or "").strip().upper() for t in tickers if (t or "").strip()})
+    if not uniq:
+        return {}
+    q_marks = ",".join(["?"] * len(uniq))
+    conn = get_conn()
+    try:
+        _sync_portfolio_table(conn)
+        rows = conn.execute(
+            f"""SELECT ticker, MAX(COALESCE(main, 0)) AS main
+                FROM {_PORTFOLIO_TABLE}
+                WHERE ticker IN ({q_marks})
+                GROUP BY ticker""",
+            tuple(uniq),
+        ).fetchall()
+        out: Dict[str, bool] = {t: False for t in uniq}
+        for r in rows:
+            out[str(r["ticker"]).upper()] = bool(int(r["main"] or 0) == 1)
+        return out
+    finally:
+        conn.close()
+
+
+def set_ticker_main_flag(ticker: str, is_main: bool) -> None:
+    """Установить флаг main для всех текущих мест хранения тикера."""
+    t = ticker.strip().upper()
+    if not t:
+        return
+    conn = get_conn()
+    try:
+        _sync_portfolio_table(conn)
+        conn.execute(
+            f"""
+            UPDATE {_PORTFOLIO_TABLE}
+            SET main = ?, updated_at = datetime('now')
+            WHERE ticker = ?
+            """,
+            (1 if is_main else 0, t),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -850,54 +1300,141 @@ def set_instrument_asset_subclass(ticker: str, asset_subclass_id: int):
 def is_ticker_buy_blocked(ticker: str) -> bool:
     conn = get_conn()
     try:
+        _sync_portfolio_table(conn)
         row = conn.execute(
-            "SELECT buy_blocked FROM instruments WHERE ticker = ?",
+            """
+            SELECT 1
+            FROM portfolio
+            WHERE ticker = ? AND COALESCE(blocked, 0) = 1
+            LIMIT 1
+            """,
             (ticker.upper(),),
         ).fetchone()
-        return bool(row and int(row["buy_blocked"] or 0) == 1)
+        return row is not None
     finally:
         conn.close()
 
 
-def list_buy_blocked_tickers() -> List[str]:
+def list_buy_blocked_tickers(main_only: bool = False) -> List[str]:
     conn = get_conn()
     try:
-        rows = conn.execute(
-            "SELECT ticker FROM instruments WHERE COALESCE(buy_blocked, 0) = 1 ORDER BY ticker"
-        ).fetchall()
+        _sync_portfolio_table(conn)
+        if main_only:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ticker
+                FROM portfolio
+                WHERE COALESCE(blocked, 0) = 1
+                  AND COALESCE(main, 0) = 1
+                ORDER BY ticker
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ticker
+                FROM portfolio
+                WHERE COALESCE(blocked, 0) = 1
+                ORDER BY ticker
+                """
+            ).fetchall()
         return [str(r["ticker"]).upper() for r in rows]
     finally:
         conn.close()
 
 
 def set_ticker_buy_blocked(ticker: str, blocked: bool) -> None:
-    """Пометить тикер как недоступный для покупки в ребалансировке."""
-    from app.services.prices import _detect_provider
-
+    """Пометить все текущие места хранения тикера как (не)доступные для покупки."""
     t = ticker.strip().upper()
     if not t:
         return
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT ticker FROM instruments WHERE ticker = ?",
-            (t,),
-        ).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE instruments SET buy_blocked = ? WHERE ticker = ?",
-                (1 if blocked else 0, t),
-            )
-        else:
-            prov, psym = _detect_provider(t)
-            conn.execute(
-                """INSERT INTO instruments (ticker, provider, provider_symbol, buy_blocked)
-                   VALUES (?, ?, ?, ?)""",
-                (t, prov, psym or "", 1 if blocked else 0),
-            )
+        _sync_portfolio_table(conn)
+        conn.execute(
+            """
+            UPDATE portfolio
+            SET blocked = ?, updated_at = datetime('now')
+            WHERE ticker = ?
+            """,
+            (1 if blocked else 0, t),
+        )
         conn.commit()
     finally:
         conn.close()
+
+
+def list_portfolio_blocks(main_only: bool = False) -> List[Dict[str, object]]:
+    """Текущие позиции (тикер+место) и флаг блокировки покупки по каждой строке."""
+    conn = get_conn()
+    try:
+        _sync_portfolio_table(conn)
+        if main_only:
+            rows = conn.execute(
+                """
+                SELECT b.ticker,
+                       b.storage_id,
+                       COALESCE(s.name, '—') AS storage_name,
+                       COALESCE(b.blocked, 0) AS blocked
+                FROM portfolio b
+                LEFT JOIN storages s ON s.id = b.storage_id
+                WHERE COALESCE(b.main, 0) = 1
+                ORDER BY b.ticker, storage_name
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT b.ticker,
+                       b.storage_id,
+                       COALESCE(s.name, '—') AS storage_name,
+                       COALESCE(b.blocked, 0) AS blocked
+                FROM portfolio b
+                LEFT JOIN storages s ON s.id = b.storage_id
+                ORDER BY b.ticker, storage_name
+                """
+            ).fetchall()
+        return [
+            {
+                "ticker": str(r["ticker"]).upper(),
+                "storage_id": int(r["storage_id"]),
+                "storage_name": str(r["storage_name"] or "—"),
+                "blocked": int(r["blocked"] or 0) == 1,
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def set_portfolio_blocked(ticker: str, storage_id: int, blocked: bool) -> None:
+    """Поставить/снять блокировку покупки для пары (тикер, место хранения)."""
+    t = ticker.strip().upper()
+    sid = int(storage_id)
+    conn = get_conn()
+    try:
+        _sync_portfolio_table(conn)
+        conn.execute(
+            """
+            UPDATE portfolio
+            SET blocked = ?, updated_at = datetime('now')
+            WHERE ticker = ? AND storage_id = ?
+            """,
+            (1 if blocked else 0, t, sid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_portfolio_ticker_storage_blocks() -> List[Dict[str, object]]:
+    """Backward-compatible alias; use list_portfolio_blocks()."""
+    return list_portfolio_blocks()
+
+
+def set_ticker_storage_buy_blocked(ticker: str, storage_id: int, blocked: bool) -> None:
+    """Backward-compatible alias; use set_portfolio_blocked()."""
+    set_portfolio_blocked(ticker=ticker, storage_id=storage_id, blocked=blocked)
 
 
 def get_default_storage_id() -> int:
@@ -1086,19 +1623,81 @@ def add_transaction(
     ticker: str,
     amount: float,
     asset_subclass_id: int,
-    currency: Optional[str] = None,
     storage_id: Optional[int] = None,
+    transaction_type: str = "trade",
 ) -> int:
+    tx_type = (transaction_type or "trade").strip().lower()
+    if tx_type not in ("trade", "transfer", "split", "bond_redemption", "conversion_blocked"):
+        raise ValueError(
+            "transaction_type must be 'trade', 'transfer', 'split', 'bond_redemption' or 'conversion_blocked'"
+        )
     sid = storage_id if storage_id is not None else get_default_storage_id()
+    t = ticker.strip().upper()
+    set_instrument_asset_subclass(t, int(asset_subclass_id))
     conn = get_conn()
     try:
         cur = conn.execute(
-            """INSERT INTO transactions (ticker, amount, asset_subclass_id, currency, storage_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (ticker.strip().upper(), amount, asset_subclass_id, currency, sid),
+            """INSERT INTO transactions (ticker, amount, storage_id, transaction_type)
+               VALUES (?, ?, ?, ?)""",
+            (t, amount, sid, tx_type),
         )
+        _sync_portfolio_table(conn)
         conn.commit()
         return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def add_bond_redemption_transaction(
+    ticker: str,
+    amount: float,
+    asset_subclass_id: int,
+    storage_id: Optional[int] = None,
+) -> int:
+    """
+    Записать полное погашение облигации как отдельный тип операции.
+    amount должен быть отрицательным (уменьшение позиции в штуках).
+    """
+    qty = float(amount)
+    if qty >= 0:
+        raise ValueError("bond redemption amount must be negative")
+    return add_transaction(
+        ticker=ticker,
+        amount=qty,
+        asset_subclass_id=asset_subclass_id,
+        storage_id=storage_id,
+        transaction_type="bond_redemption",
+    )
+
+
+def add_transfer_transaction(
+    ticker: str,
+    amount: float,
+    asset_subclass_id: int,
+    from_storage_id: int,
+    to_storage_id: int,
+) -> None:
+    qty = float(amount)
+    if qty <= 0:
+        raise ValueError("amount must be positive")
+    if int(from_storage_id) == int(to_storage_id):
+        raise ValueError("from_storage_id and to_storage_id must differ")
+    conn = get_conn()
+    try:
+        t = ticker.strip().upper()
+        set_instrument_asset_subclass(t, int(asset_subclass_id))
+        conn.execute(
+            """INSERT INTO transactions (ticker, amount, storage_id, transaction_type)
+               VALUES (?, ?, ?, 'transfer')""",
+            (t, -qty, int(from_storage_id)),
+        )
+        conn.execute(
+            """INSERT INTO transactions (ticker, amount, storage_id, transaction_type)
+               VALUES (?, ?, ?, 'transfer')""",
+            (t, qty, int(to_storage_id)),
+        )
+        _sync_portfolio_table(conn)
+        conn.commit()
     finally:
         conn.close()
 
@@ -1107,11 +1706,11 @@ def list_transactions() -> List[Transaction]:
     conn = get_conn()
     try:
         rows = conn.execute(
-            """SELECT t.id, t.ticker, t.amount, t.asset_subclass_id, t.currency, t.created_at,
+            """SELECT t.id, t.ticker, t.amount, t.transaction_type, t.created_at,
                       t.storage_id, s.name AS storage_name
                FROM transactions t
                LEFT JOIN storages s ON s.id = t.storage_id
-               ORDER BY t.created_at DESC"""
+               ORDER BY t.created_at DESC, t.id DESC"""
         ).fetchall()
         default_sid = get_default_storage_id()
         return [
@@ -1119,8 +1718,8 @@ def list_transactions() -> List[Transaction]:
                 r["id"],
                 r["ticker"],
                 r["amount"],
-                r["asset_subclass_id"],
-                r["currency"],
+                resolve_asset_subclass_id(r["ticker"]),
+                str(r["transaction_type"] or "trade"),
                 r["created_at"],
                 int(r["storage_id"]) if r["storage_id"] is not None else default_sid,
                 r["storage_name"],
@@ -1157,21 +1756,12 @@ def get_first_subclass_id() -> int:
 
 
 def get_latest_transaction_subclass(ticker: str) -> Optional[int]:
-    conn = get_conn()
-    try:
-        row = conn.execute(
-            """SELECT asset_subclass_id FROM transactions
-               WHERE ticker = ? ORDER BY created_at DESC LIMIT 1""",
-            (ticker.upper(),),
-        ).fetchone()
-        return int(row["asset_subclass_id"]) if row else None
-    finally:
-        conn.close()
+    return None
 
 
 def resolve_asset_subclass_id(ticker: str) -> int:
     """
-    Подкласс для сделок/отображения: настройка → последняя сделка → эвристика по тикеру → дефолт.
+    Подкласс для сделок/отображения: настройка → эвристика по тикеру → дефолт.
     Всегда возвращает валидный id.
     """
     from app.services.subclass_inference import DEFAULT_SUBCLASS_NAME, infer_subclass_name
@@ -1180,9 +1770,6 @@ def resolve_asset_subclass_id(ticker: str) -> int:
     cfg = get_instrument_asset_subclass(t)
     if cfg is not None:
         return cfg
-    last = get_latest_transaction_subclass(t)
-    if last is not None:
-        return last
     guessed_name = infer_subclass_name(t)
     if guessed_name:
         sid = get_subclass_id_by_name(guessed_name)
@@ -1204,24 +1791,31 @@ def list_aggregated_positions() -> List[Position]:
     """Сумма по паре (тикер, место хранения); подкласс — как у тикера в целом. Остаток > 0."""
     conn = get_conn()
     try:
-        rows = conn.execute(
-            """SELECT t.ticker, t.storage_id, MAX(s.name) AS storage_name,
-                      SUM(t.amount) AS total,
-                      COALESCE(
-                        (SELECT i.asset_subclass_id FROM instruments i
-                         WHERE i.ticker = t.ticker AND i.asset_subclass_id IS NOT NULL),
-                        (SELECT asset_subclass_id FROM transactions t2
-                         WHERE t2.ticker = t.ticker ORDER BY created_at DESC LIMIT 1)
-                      ) AS asset_subclass_id
-               FROM transactions t
-               LEFT JOIN storages s ON s.id = t.storage_id
-               GROUP BY t.ticker, t.storage_id
-               HAVING total > 0
-               ORDER BY t.ticker, storage_name"""
-        ).fetchall()
+        if _instruments_has_asset_subclass_column(conn):
+            rows = conn.execute(
+                """SELECT t.ticker, t.storage_id, MAX(s.name) AS storage_name,
+                         SUM(t.amount) AS total,
+                         (SELECT i.asset_subclass_id FROM instruments i
+                          WHERE i.ticker = t.ticker AND i.asset_subclass_id IS NOT NULL) AS asset_subclass_id
+                   FROM transactions t
+                   LEFT JOIN storages s ON s.id = t.storage_id
+                   GROUP BY t.ticker, t.storage_id
+                   HAVING total > 0
+                   ORDER BY t.ticker, storage_name"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT t.ticker, t.storage_id, MAX(s.name) AS storage_name,
+                         SUM(t.amount) AS total
+                   FROM transactions t
+                   LEFT JOIN storages s ON s.id = t.storage_id
+                   GROUP BY t.ticker, t.storage_id
+                   HAVING total > 0
+                   ORDER BY t.ticker, storage_name"""
+            ).fetchall()
         out = []
         for r in rows:
-            sid_sub = r["asset_subclass_id"]
+            sid_sub = r["asset_subclass_id"] if "asset_subclass_id" in r.keys() else None
             if sid_sub is None:
                 sid_sub = resolve_asset_subclass_id(r["ticker"])
             st_id = int(r["storage_id"]) if r["storage_id"] is not None else get_default_storage_id()
@@ -1247,27 +1841,39 @@ def list_positions() -> List[Position]:
     return list_aggregated_positions()
 
 
-def list_positions_by_ticker() -> List[Position]:
+def list_positions_by_ticker(main_only: bool = False) -> List[Position]:
     """Одна строка на тикер: суммарное количество по всем местам хранения (для сводной таблицы)."""
     conn = get_conn()
     try:
-        rows = conn.execute(
-            """SELECT t.ticker,
-                      SUM(t.amount) AS total,
-                      COALESCE(
-                        (SELECT i.asset_subclass_id FROM instruments i
-                         WHERE i.ticker = t.ticker AND i.asset_subclass_id IS NOT NULL),
-                        (SELECT asset_subclass_id FROM transactions t2
-                         WHERE t2.ticker = t.ticker ORDER BY created_at DESC LIMIT 1)
-                      ) AS asset_subclass_id
-               FROM transactions t
-               GROUP BY t.ticker
-               HAVING total > 0
-               ORDER BY t.ticker"""
-        ).fetchall()
+        _sync_portfolio_table(conn)
+        where_main = "WHERE COALESCE(p.main, 0) = 1" if main_only else ""
+        if _instruments_has_asset_subclass_column(conn):
+            rows = conn.execute(
+                f"""SELECT t.ticker,
+                         SUM(t.amount) AS total,
+                         (SELECT i.asset_subclass_id FROM instruments i
+                          WHERE i.ticker = t.ticker AND i.asset_subclass_id IS NOT NULL) AS asset_subclass_id
+                   FROM transactions t
+                   LEFT JOIN {_PORTFOLIO_TABLE} p ON p.ticker = t.ticker AND p.storage_id = t.storage_id
+                   {where_main}
+                   GROUP BY t.ticker
+                   HAVING total > 0
+                   ORDER BY t.ticker"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""SELECT t.ticker,
+                         SUM(t.amount) AS total
+                   FROM transactions t
+                   LEFT JOIN {_PORTFOLIO_TABLE} p ON p.ticker = t.ticker AND p.storage_id = t.storage_id
+                   {where_main}
+                   GROUP BY t.ticker
+                   HAVING total > 0
+                   ORDER BY t.ticker"""
+            ).fetchall()
         out: List[Position] = []
         for r in rows:
-            sid_sub = r["asset_subclass_id"]
+            sid_sub = r["asset_subclass_id"] if "asset_subclass_id" in r.keys() else None
             if sid_sub is None:
                 sid_sub = resolve_asset_subclass_id(r["ticker"])
             out.append(

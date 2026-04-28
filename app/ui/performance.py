@@ -21,10 +21,12 @@ def render_performance() -> None:
     rub = float(fx.get("rub") or 95.0)
     eur = float(fx.get("eur") or 0.92)
 
+    live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
     result = compute_portfolio_performance(
         display_currency=display_ccy,
         rub_per_usd=rub,
         eur_per_usd=eur,
+        allow_fetch_missing_prices=live_updates_enabled,
     )
     if not result.points:
         st.info("Недостаточно данных: добавьте хотя бы одну сделку.")
@@ -61,9 +63,9 @@ def render_performance() -> None:
         }
     )
     st.subheader("Кривая стоимости")
-    st.line_chart(df.set_index("date")["portfolio_value"], use_container_width=True)
+    st.line_chart(df.set_index("date")["portfolio_value"], width="stretch")
     st.subheader("Кумулятивная TWR доходность")
-    st.line_chart(df.set_index("date")["twr_cum_return"], use_container_width=True)
+    st.line_chart(df.set_index("date")["twr_cum_return"], width="stretch")
 
     low_coverage_days = int((df["priced_ratio"] < 1.0).sum())
     if result.missing_price_tickers or low_coverage_days > 0:

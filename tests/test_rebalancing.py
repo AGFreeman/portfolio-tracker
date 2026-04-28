@@ -114,6 +114,18 @@ class TestComputePlan(unittest.TestCase):
         # subclass 2 has budget but no priced holdings
         self.assertTrue(any(u.subclass_id == 2 for u in plan.unallocated))
 
+    def test_minimize_unsettled_cash_with_extra_lots(self):
+        rows = [
+            TickerPositionValue("AAA", 1, 50.0, 60.0),
+            TickerPositionValue("BBB", 1, 50.0, 40.0),
+        ]
+        targets = {1: 100.0}
+        names = {1: "Sub1"}
+        plan = compute_rebalance_plan(rows, targets, names, 100.0)
+        # Equal split gives 50/50 -> initial implied 40 and large residual.
+        # Optimizer should use residual to buy extra cheapest lot(s), reducing unsettled cash.
+        self.assertLessEqual(plan.residual_vs_V, 20.0)
+
 
 if __name__ == "__main__":
     unittest.main()
