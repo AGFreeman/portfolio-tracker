@@ -1,24 +1,58 @@
-"""Одна строка на тикер: колонка на каждое место хранения + всего + цена."""
+"""Одна строка на тикер: колонка на каждое место хранения + всего."""
 from collections import defaultdict
-from datetime import timedelta
 
+import pandas as pd
 import streamlit as st
 
 from app.db import list_positions, list_storages
-from app.services.fx import convert_amount, format_money
-from app.services.price_currency import infer_quote_currency
-from app.services.prices import get_app_quotes, is_crypto_ticker, normalize_quote_price_for_valuation
+
+# Остатки в этих местах — дробные; во всех остальных колонках мест — целые штуки.
+_CRYPTO_ONLY_STORAGE_KEYS = frozenset({"binance", "bybit", "metamask", "trustwallet"})
 
 
-def _fmt_qty(ticker: str, amount: float):
-    if is_crypto_ticker(ticker):
+def _storage_name_key(name: str) -> str:
+    return (name or "").strip().casefold().replace(" ", "").replace("-", "")
+
+
+def _is_crypto_only_storage(place_name: str) -> bool:
+    return _storage_name_key(place_name) in _CRYPTO_ONLY_STORAGE_KEYS
+
+
+def _fmt_qty_for_storage(place_name: str, amount: float) -> float:
+    if not amount:
+        return 0.0
+    if _is_crypto_only_storage(place_name):
         return float(amount)
-    return int(round(amount))
+    return float(int(round(amount)))
+
+
+def _row_total_needs_decimal_display(row: pd.Series, place_columns: list[str]) -> bool:
+    if any(
+        _is_crypto_only_storage(c) and float(row[c]) != 0.0
+        for c in place_columns
+    ):
+        return True
+    total = float(row["Всего"])
+    return abs(total - round(total)) > 1e-9
 
 
 def _storage_column_names() -> list[str]:
     """Имена мест в порядке sort_order; только непустые."""
     return [s.name for s in list_storages() if (s.name or "").strip()]
+
+
+def _storage_qty_display_styler(df: pd.DataFrame, place_columns: list[str]) -> pd.io.formats.style.Styler:
+    """По имени места: Binance/Bybit/Metamask/TrustWallet — десятичные, остальные места — целые; «Всего» — см. строку."""
+    sty = df.style
+    for ridx in range(len(df)):
+        for col in place_columns:
+            fmt = "{:.10g}" if _is_crypto_only_storage(col) else "{:.0f}"
+            sty = sty.format(formatter=fmt, subset=pd.IndexSlice[ridx, [col]])
+    for ridx in range(len(df)):
+        row = df.iloc[ridx]
+        fmt = "{:.10g}" if _row_total_needs_decimal_display(row, place_columns) else "{:.0f}"
+        sty = sty.format(formatter=fmt, subset=pd.IndexSlice[ridx, ["Всего"]])
+    return sty
 
 
 @st.fragment()
@@ -27,11 +61,6 @@ def render_storage_allocations_fragment():
     if not positions:
         st.info("Нет позиций. Добавьте позиции в боковой панели.")
         return
-
-    fx = st.session_state.get("fx_cache") or {}
-    rub = float(fx.get("rub") or 95.0)
-    eur = float(fx.get("eur") or 0.92)
-    display_ccy = st.session_state.get("display_currency", "RUB")
 
     # Колонки: все места из справочника + неизвестные имена из сделок
     base_places = _storage_column_names()
@@ -51,8 +80,6 @@ def render_storage_allocations_fragment():
         qty_by_ticker_place[p.ticker][place] += float(p.amount)
 
     tickers_sorted = sorted(qty_by_ticker_place.keys())
-    live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
-    quotes = get_app_quotes(tickers_sorted)
 
     rows: list[dict] = []
     for ticker in tickers_sorted:
@@ -61,35 +88,26 @@ def render_storage_allocations_fragment():
         for place in place_columns:
             amt = qty_by_ticker_place[ticker].get(place, 0.0)
             total += amt
-            # Все ячейки — строки: иначе Arrow ругается на object-колонку с int и «—».
-            if amt == 0:
-                row[place] = "—"
-            else:
-                row[place] = str(_fmt_qty(ticker, amt))
-        row["Всего"] = str(_fmt_qty(ticker, total))
-
-        q = quotes.get(ticker)
-        raw_price = q.price if q else None
-        quote_ccy = q.currency if q else infer_quote_currency(ticker)
-        price = normalize_quote_price_for_valuation(ticker, raw_price, quote_ccy)
-        if price is not None:
-            price_disp = convert_amount(price, quote_ccy, display_ccy, rub, eur)
-            row["Цена"] = format_money(price_disp, display_ccy)
-        else:
-            row["Цена"] = "—"
+            # Числа (0 вместо пустой ячейки); дробность задаётся местом хранения, не тикером.
+            row[place] = _fmt_qty_for_storage(place, amt)
+        row["Всего"] = float(total)
 
         rows.append(row)
 
     st.caption(
-        f"По каждому тикеру — **одна строка**; столбцы — остатки по местам из справочника, затем **Всего** и **Цена** "
-        f"({display_ccy} за единицу). "
-        f"{'Автообновление котировок включено.' if live_updates_enabled else 'Автообновление котировок отключено.'}"
+        "По каждому тикеру — **одна строка**; остатки по местам (**Binance**, **Bybit**, **Metamask**, **TrustWallet** — "
+        "дробные, остальные места — **целые штуки**), затем **Всего**."
     )
+    df = pd.DataFrame(rows, columns=["Тикер", *place_columns, "Всего"])
+    styled = _storage_qty_display_styler(df, place_columns)
     st.dataframe(
-        rows,
+        styled,
         width="stretch",
         hide_index=True,
         key="storage_allocations_df",
+        column_config={
+            "Тикер": st.column_config.TextColumn("Тикер"),
+        },
     )
 
 
