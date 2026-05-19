@@ -150,7 +150,6 @@ def _compute_portfolio_performance_cached(
     display_currency: str,
     rub_per_usd: float,
     eur_per_usd: float,
-    allow_fetch_missing_prices: bool,
     mwr_curve_frequency: str,
     db_mtime: float,
 ):
@@ -159,9 +158,47 @@ def _compute_portfolio_performance_cached(
         display_currency=display_currency,
         rub_per_usd=rub_per_usd,
         eur_per_usd=eur_per_usd,
-        allow_fetch_missing_prices=allow_fetch_missing_prices,
         mwr_curve_frequency=mwr_curve_frequency,
     )
+
+
+def _perf_session_cache_key(
+    display_currency: str,
+    mwr_curve_frequency: str,
+    db_mtime: float,
+) -> str:
+    """Flat string key — tuple keys in nested dicts are unreliable in Streamlit session_state."""
+    ccy = str(display_currency or "RUB").upper()
+    freq = str(mwr_curve_frequency or "daily").strip().lower()
+    mtime = int(float(db_mtime))
+    return f"portfolio_perf:{ccy}:{freq}:{mtime}"
+
+
+def _get_portfolio_performance(
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    mwr_curve_frequency: str,
+    db_mtime: float,
+):
+    """One heavy compute per rerun per parameter set (Streamlit tabs call this twice)."""
+    # FX and live-toggle are not part of the cache key: historical series uses DB quotes,
+    # and the last point is refreshed via live quotes inside compute_portfolio_performance.
+    session_key = _perf_session_cache_key(
+        display_currency, mwr_curve_frequency, db_mtime
+    )
+    cached = st.session_state.get(session_key)
+    if cached is not None:
+        return cached
+    result = _compute_portfolio_performance_cached(
+        display_currency=display_currency,
+        rub_per_usd=rub_per_usd,
+        eur_per_usd=eur_per_usd,
+        mwr_curve_frequency=mwr_curve_frequency,
+        db_mtime=db_mtime,
+    )
+    st.session_state[session_key] = result
+    return result
 
 
 def render_performance_top_metrics() -> None:
@@ -172,14 +209,10 @@ def render_performance_top_metrics() -> None:
     eur = float(fx.get("eur") or 0.92)
     db_path = Path(__file__).resolve().parents[2] / "data" / "portfolio.db"
     db_mtime = float(db_path.stat().st_mtime) if db_path.exists() else 0.0
-    live_updates_enabled = bool(
-        st.session_state.get("live_price_updates_enabled", False)
-    )
-    result = _compute_portfolio_performance_cached(
+    result = _get_portfolio_performance(
         display_currency=display_ccy,
         rub_per_usd=rub,
         eur_per_usd=eur,
-        allow_fetch_missing_prices=live_updates_enabled,
         mwr_curve_frequency="monthly",
         db_mtime=db_mtime,
     )
@@ -250,22 +283,28 @@ def render_performance() -> None:
         "Частота графиков",
         options=["Months", "Weeks", "Days"],
         default="Months",
-        help="Months быстрее, Weeks сбалансировано, Days детальнее. Применяется ко всем графикам.",
+        key="perf_chart_frequency",
+        help=(
+            "Months быстрее, Weeks сбалансировано, Days детальнее (замедляет каждое обновление страницы). "
+            "Применяется ко всем графикам."
+        ),
     )
     chart_frequency = (
         "monthly"
         if freq_label == "Months"
         else ("weekly" if freq_label == "Weeks" else "daily")
     )
+    if chart_frequency == "daily":
+        st.caption(
+            "Режим «Days» пересчитывает MWR на каждый день истории — страница будет загружаться дольше."
+        )
     db_path = Path(__file__).resolve().parents[2] / "data" / "portfolio.db"
     db_mtime = float(db_path.stat().st_mtime) if db_path.exists() else 0.0
 
-    live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
-    result = _compute_portfolio_performance_cached(
+    result = _get_portfolio_performance(
         display_currency=display_ccy,
         rub_per_usd=rub,
         eur_per_usd=eur,
-        allow_fetch_missing_prices=live_updates_enabled,
         mwr_curve_frequency=chart_frequency,
         db_mtime=db_mtime,
     )

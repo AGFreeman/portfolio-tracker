@@ -296,7 +296,7 @@ def render_rebalancing():
             "Рассчитать покупки",
             type="primary",
             key="rebalance_compute",
-            use_container_width=True,
+            width="stretch",
         ):
             request_quotes_refresh()
             st.session_state["rebalance_last_V"] = float(V)
@@ -320,7 +320,7 @@ def render_rebalancing():
     if st.button(
         f"Настроить блокировки по местам ({len(blocked_current)} тик.)",
         key="rebalance_open_blocked_dialog",
-        use_container_width=True,
+        width="stretch",
     ):
         _render_blocked_tickers_dialog()
     blocked = {t.upper() for t in list_buy_blocked_tickers(main_only=True)}

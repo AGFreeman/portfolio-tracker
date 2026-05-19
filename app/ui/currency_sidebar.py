@@ -5,11 +5,11 @@ import streamlit as st
 
 from app.services.fx import fetch_usd_cross_rates
 from app.services.prices import request_quotes_refresh
-from app.services.performance import refresh_today_historical_quotes
 from app.ui.cash_flows import render_cash_flow_sidebar
+from app.ui.live_refresh import live_quotes_run_every
 
-@st.fragment()
-def render_fx_live_block():
+
+def _render_fx_live_block_body():
     """Периодически тянет курсы и пишет в session_state для таблицы портфеля."""
     live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
     cache = st.session_state.get("fx_cache") or {}
@@ -62,6 +62,16 @@ def render_fx_live_block():
         st.metric("EUR / RUB", f"{eur_rub:,.2f}")
 
 
+def render_fx_live_block():
+    run_every = live_quotes_run_every()
+
+    @st.fragment(run_every=run_every)
+    def _fragment():
+        _render_fx_live_block_body()
+
+    _fragment()
+
+
 def render_currency_sidebar():
     st.session_state.setdefault("display_currency", "RUB")
     st.session_state.setdefault("live_price_updates_enabled", False)
@@ -69,13 +79,14 @@ def render_currency_sidebar():
     st.toggle(
         "Live price updates",
         key="live_price_updates_enabled",
-        help="По умолчанию выключено. Когда включено, цены обновляются примерно раз в 60 секунд.",
+        help="По умолчанию выключено. Когда включено, сводка и курсы обновляются каждые 60 секунд.",
     )
     prev_live = bool(st.session_state.get("_prev_live_price_updates_enabled", st.session_state["live_price_updates_enabled"]))
     curr_live = bool(st.session_state.get("live_price_updates_enabled", False))
     if curr_live != prev_live:
         request_quotes_refresh()
-        refresh_today_historical_quotes()
+        if curr_live:
+            st.session_state["historical_quotes_today_refreshed_once"] = False
         st.session_state["_prev_live_price_updates_enabled"] = curr_live
     if st.button("Force price update", key="force_price_update_now"):
         rub, eur, source, err = fetch_usd_cross_rates()
@@ -87,7 +98,7 @@ def render_currency_sidebar():
             "err": err,
         }
         request_quotes_refresh()
-        refresh_today_historical_quotes()
+        st.session_state["historical_quotes_today_refreshed_once"] = False
         st.rerun()
 
     render_fx_live_block()
@@ -99,4 +110,3 @@ def render_currency_sidebar():
     )
 
     render_cash_flow_sidebar()
-

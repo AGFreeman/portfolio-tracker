@@ -1,8 +1,8 @@
 """Fetch live price by ticker. Multi-provider: yfinance, MOEX ISS, CoinGecko, T-Bank. Session cache."""
 import os
 import re
+import threading
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from dataclasses import dataclass
@@ -29,6 +29,8 @@ MOEX_TICKERS = {
 
 _HTTP = requests.Session()
 _TBANK_FIGI_BY_SYMBOL: Dict[str, tuple] = {}  # SYMBOL -> (figi, currency)
+_TBANK_SSL_VERIFY: Optional[bool] = None  # None=unknown, True/False after first probe
+_TBANK_SSL_LOCK = threading.Lock()
 LIVE_QUOTES_REFRESH_SEC = 60
 DISABLED_QUOTES_TTL_SEC = 24 * 60 * 60
 _ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
@@ -193,6 +195,13 @@ def _detect_instrument_kind(
     key = (prov, sym.upper())
     if key in _INSTRUMENT_KIND_BY_PROVIDER_SYMBOL:
         return _INSTRUMENT_KIND_BY_PROVIDER_SYMBOL[key]
+    # Equities on MOEX do not need bond detection HTTP; ISIN-like tickers use fast path below.
+    if prov == "moex_iss" and not _ISIN_RE.match((ticker or "").upper().strip()):
+        _INSTRUMENT_KIND_BY_PROVIDER_SYMBOL[key] = None
+        return None
+    if prov not in ("moex_iss", "tbank"):
+        _INSTRUMENT_KIND_BY_PROVIDER_SYMBOL[key] = None
+        return None
     kind: Optional[str] = None
     if prov == "tbank":
         kind = _detect_tbank_instrument_kind(sym)
@@ -522,12 +531,31 @@ def _tbank_post(url: str, headers: dict, payload: dict, timeout: int = 8):
     T-Bank POST with secure-first strategy.
     If local cert trust is broken, retry once without verify to keep functionality.
     """
-    try:
+    global _TBANK_SSL_VERIFY
+    if _TBANK_SSL_VERIFY is False:
+        return _HTTP.post(
+            url, headers=headers, json=payload, timeout=timeout, verify=False
+        )
+    if _TBANK_SSL_VERIFY is True:
         return _HTTP.post(url, headers=headers, json=payload, timeout=timeout)
-    except requests.exceptions.SSLError:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
-            return _HTTP.post(url, headers=headers, json=payload, timeout=timeout, verify=False)
+
+    with _TBANK_SSL_LOCK:
+        if _TBANK_SSL_VERIFY is False:
+            return _HTTP.post(
+                url, headers=headers, json=payload, timeout=timeout, verify=False
+            )
+        if _TBANK_SSL_VERIFY is True:
+            return _HTTP.post(url, headers=headers, json=payload, timeout=timeout)
+        try:
+            r = _HTTP.post(url, headers=headers, json=payload, timeout=timeout)
+            _TBANK_SSL_VERIFY = True
+            return r
+        except requests.exceptions.SSLError:
+            _TBANK_SSL_VERIFY = False
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            return _HTTP.post(
+                url, headers=headers, json=payload, timeout=timeout, verify=False
+            )
 
 
 def _tbank_find_instrument(symbol: str) -> Optional[tuple]:
@@ -1215,7 +1243,6 @@ def request_quotes_refresh(session_state_key: str = "price_cache") -> None:
     st.session_state.pop(f"{session_state_key}_meta", None)
     _TBANK_FIGI_BY_SYMBOL.clear()
     _PROVIDER_SYMBOL_BY_TICKER.clear()
-    _INSTRUMENT_KIND_BY_PROVIDER_SYMBOL.clear()
     st.session_state["force_price_refresh_once"] = True
 
 
@@ -1233,13 +1260,16 @@ def get_app_quotes(tickers: List[str], session_state_key: str = "price_cache") -
     if not normalized:
         return {}
     # Guardrail: never fetch quotes for tickers that are not in active portfolio positions.
-    from app.db import list_positions_by_ticker
+    portfolio_tickers = st.session_state.get("_active_portfolio_tickers")
+    if portfolio_tickers is None:
+        from app.db import list_positions_by_ticker
 
-    portfolio_tickers = {
-        str(p.ticker or "").upper().strip()
-        for p in list_positions_by_ticker()
-        if float(p.amount or 0) > 0
-    }
+        portfolio_tickers = {
+            str(p.ticker or "").upper().strip()
+            for p in list_positions_by_ticker()
+            if float(p.amount or 0) > 0
+        }
+        st.session_state["_active_portfolio_tickers"] = portfolio_tickers
     live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
     force_refresh_once = bool(st.session_state.get("force_price_refresh_once", False))
     cache = st.session_state.get(session_state_key) or {}

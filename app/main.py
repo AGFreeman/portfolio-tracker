@@ -27,6 +27,8 @@ from app.ui.cash_flows import render_cash_flows
 from app.services.performance import refresh_today_historical_quotes
 
 st.set_page_config(page_title="Портфель", layout="wide")
+# Per-rerun snapshot for quote guardrail (avoid repeated list_positions_by_ticker).
+st.session_state.pop("_active_portfolio_tickers", None)
 
 # Базовая инициализация БД без автоприменения миграций:
 # на этапе активной разработки структура и данные поддерживаются вручную.
@@ -35,13 +37,15 @@ seed_asset_classes_if_empty()
 apply_default_target_percentages_if_unset()
 reconcile_asset_class_targets()
 
-if not bool(st.session_state.get("historical_quotes_today_refreshed_once", False)):
-    refresh_today_historical_quotes()
-    st.session_state["historical_quotes_today_refreshed_once"] = True
-
-# Sidebar: FX + display currency, then actions
 with st.sidebar:
     render_currency_sidebar()
+    # One refresh per enable: toggle resets the flag; runs here (not in the toggle handler).
+    if bool(st.session_state.get("live_price_updates_enabled", False)) and not bool(
+        st.session_state.get("historical_quotes_today_refreshed_once", False)
+    ):
+        with st.spinner("Обновление сегодняшних котировок…"):
+            refresh_today_historical_quotes()
+        st.session_state["historical_quotes_today_refreshed_once"] = True
     st.divider()
     st.header("Действия")
     st.caption(

@@ -20,6 +20,7 @@ from app.services.prices import (
     is_crypto_ticker,
     normalize_quote_price_for_valuation,
 )
+from app.ui.live_refresh import live_quotes_run_every
 
 _SUBCLASS_BY_ID = None
 
@@ -58,7 +59,7 @@ def _class_by_id():
     return {c.id: c for c in list_asset_classes()}
 
 
-def render_portfolio_total_metric():
+def _render_portfolio_total_metric_body():
     """Top-level metric for total portfolio value (above main tabs)."""
     positions = list_positions_by_ticker()
     display_ccy = st.session_state.get("display_currency", "RUB")
@@ -144,8 +145,7 @@ def render_portfolio_total_metric():
     )
 
 
-@st.fragment()
-def render_portfolio_table_fragment():
+def _render_portfolio_table_body():
     positions = list_positions_by_ticker()
     if not positions:
         st.session_state["portfolio_total"] = {
@@ -172,6 +172,12 @@ def render_portfolio_table_fragment():
     quotes = get_app_quotes(tickers)
     meta = get_quotes_cache_meta()
     stale_tickers = set(meta.get("stale_tickers") or [])
+    if live_updates_enabled and meta.get("ts"):
+            q_ts = time.strftime(
+                "%H:%M:%S",
+                time.localtime(float(meta["ts"])),
+            )
+            st.caption(f"Котировки обновлены: {q_ts}")
 
     main_rows = []
     other_rows = []
@@ -311,6 +317,22 @@ def render_portfolio_table_fragment():
             )
         else:
             st.info("Нет инструментов с `main = 0`.")
+def render_portfolio_total_metric():
+    run_every = live_quotes_run_every()
+
+    @st.fragment(run_every=run_every)
+    def _fragment():
+        _render_portfolio_total_metric_body()
+
+    _fragment()
+
+
 def render_portfolio_table():
     """Сводка с автообновлением цен (fragment)."""
-    render_portfolio_table_fragment()
+    run_every = live_quotes_run_every()
+
+    @st.fragment(run_every=run_every)
+    def _fragment():
+        _render_portfolio_table_body()
+
+    _fragment()

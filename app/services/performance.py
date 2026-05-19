@@ -128,6 +128,18 @@ def _build_lqdt_synthetic_history_before_anchor(
     return out
 
 
+def _append_dated_cashflow(
+    rows: List[Tuple[str, float]], day: str, amount: float
+) -> None:
+    """Append or merge cashflow for `day` (days are processed in chronological order)."""
+    if abs(float(amount)) <= 1e-12:
+        return
+    if rows and rows[-1][0] == day:
+        rows[-1] = (day, float(rows[-1][1]) + float(amount))
+    else:
+        rows.append((day, float(amount)))
+
+
 def _parse_date_prefix(ts: Optional[str]) -> Optional[str]:
     if not ts:
         return None
@@ -267,11 +279,13 @@ def _build_active_intervals_by_ticker(
     return intervals
 
 
-def refresh_today_historical_quotes() -> int:
+def refresh_today_historical_quotes(force: bool = False) -> int:
     """
     Refresh historical_quotes only for current date and only active portfolio tickers.
-    Triggered by app first run and live price refresh controls.
+    Triggered by live price refresh controls and Force price update (not on cold startup).
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     today = date.today().isoformat()
     positions = list_positions_by_ticker()
     tickers = sorted(
@@ -285,7 +299,15 @@ def refresh_today_historical_quotes() -> int:
         return 0
     provider_overrides: Dict[str, Tuple[str, str]] = build_provider_overrides(tickers)
     rows_to_upsert: List[tuple] = []
+    tickers_to_fetch: List[str] = []
     for ticker in tickers:
+        if not force:
+            cached = list_cached_historical_quotes(ticker, today, today)
+            if cached and cached[0][1] is not None:
+                continue
+        tickers_to_fetch.append(ticker)
+
+    def _fetch_today_row(ticker: str) -> Optional[tuple]:
         if ticker in provider_overrides:
             prov, sym = provider_overrides[ticker]
         else:
@@ -301,17 +323,42 @@ def refresh_today_historical_quotes() -> int:
         )
         q = fetched.get(today)
         if q is None:
-            continue
-        rows_to_upsert.append((ticker, today, q.price, q.currency))
+            return None
+        return (ticker, today, q.price, q.currency)
+
+    if tickers_to_fetch:
+        workers = max(1, min(12, len(tickers_to_fetch)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_fetch_today_row, t): t for t in tickers_to_fetch}
+            for fut in as_completed(futures):
+                row = fut.result()
+                if row:
+                    rows_to_upsert.append(row)
     upsert_historical_quotes_bulk(rows_to_upsert)
     return len(rows_to_upsert)
+
+
+def _normalize_price_series(
+    ticker: str,
+    series: Dict[str, PriceQuote],
+) -> Dict[str, PriceQuote]:
+    """Normalize bond % quotes once per ticker (not per day in the main loop)."""
+    if not series:
+        return series
+    out: Dict[str, PriceQuote] = {}
+    for d, q in series.items():
+        if q.price is None:
+            out[d] = q
+            continue
+        norm_px = normalize_quote_price_for_valuation(ticker, q.price, q.currency)
+        out[d] = PriceQuote(price=norm_px, currency=q.currency)
+    return out
 
 
 def compute_portfolio_performance(
     display_currency: str,
     rub_per_usd: float,
     eur_per_usd: float,
-    allow_fetch_missing_prices: bool = True,
     mwr_curve_frequency: str = "daily",
 ) -> PerformanceResult:
     tx_by_day, first_tx_date, _last_tx_date = _load_daily_transactions()
@@ -406,15 +453,18 @@ def compute_portfolio_performance(
             )
             carried = _carry_forward_prices(raw, interval_days)
             ticker_series.update(carried)
-        prices_by_ticker[t] = ticker_series
+        prices_by_ticker[t] = _normalize_price_series(t, ticker_series)
         if intervals and not ticker_series:
             missing_price_tickers.append(t)
+
+    if benchmark_ticker and benchmark_prices:
+        benchmark_prices = _normalize_price_series(benchmark_ticker, benchmark_prices)
 
     holdings: Dict[str, float] = defaultdict(float)
     net_invested = 0.0
     points: List[PerformancePoint] = []
-    xirr_cashflows_by_day: Dict[str, float] = defaultdict(float)
-    benchmark_xirr_cashflows_by_day: Dict[str, float] = defaultdict(float)
+    xirr_flow_rows: List[Tuple[str, float]] = []
+    benchmark_xirr_flow_rows: List[Tuple[str, float]] = []
     prev_value: Optional[float] = None
     twr_factor = 1.0
     benchmark_units = 0.0
@@ -440,9 +490,9 @@ def compute_portfolio_performance(
         net_invested += day_external_cash_flow
         benchmark_cash_balance += day_external_cash_flow
         # XIRR convention: portfolio deposit is investor outflow (negative).
-        xirr_cashflows_by_day[d] += -day_external_cash_flow
-        benchmark_xirr_cashflows_by_day[d] += -day_external_cash_flow
-        if first_cashflow_day is None and abs(float(xirr_cashflows_by_day[d])) > 1e-12:
+        _append_dated_cashflow(xirr_flow_rows, d, -day_external_cash_flow)
+        _append_dated_cashflow(benchmark_xirr_flow_rows, d, -day_external_cash_flow)
+        if first_cashflow_day is None and xirr_flow_rows:
             first_cashflow_day = d
 
         for ticker, amount, _tx_type in day_tx:
@@ -458,11 +508,8 @@ def compute_portfolio_performance(
             q = prices_by_ticker.get(ticker, {}).get(d)
             if q is None or q.price is None:
                 continue
-            q_price = normalize_quote_price_for_valuation(ticker, q.price, q.currency)
-            if q_price is None:
-                continue
             securities_value += convert_amount(
-                amount=float(amount) * float(q_price),
+                amount=float(amount) * float(q.price),
                 from_ccy=q.currency,
                 to_ccy=display_currency,
                 rub_per_usd=day_rub_per_usd,
@@ -476,12 +523,8 @@ def compute_portfolio_performance(
         benchmark_mwr_cum_return: Optional[float] = None
         bq = benchmark_prices.get(d) if benchmark_ticker else None
         if bq is not None and bq.price is not None:
-            b_price = normalize_quote_price_for_valuation(
-                benchmark_ticker or "",
-                bq.price,
-                bq.currency,
-            )
-            if b_price is not None and b_price > 0:
+            b_price = float(bq.price)
+            if b_price > 0:
                 if abs(float(benchmark_cash_balance)) > 1e-12:
                     benchmark_cash_in_quote = convert_amount(
                         amount=float(benchmark_cash_balance),
@@ -509,8 +552,7 @@ def compute_portfolio_performance(
         prev_benchmark_value = float(benchmark_value)
         benchmark_cum_return = float(benchmark_twr_factor - 1.0)
         if first_cashflow_day is not None and d in mwr_anchor_days:
-            benchmark_xirr_flows = sorted(xirr_cashflows_by_day.items(), key=lambda x: x[0])
-            benchmark_xirr_flows.append((d, float(benchmark_value)))
+            benchmark_xirr_flows = [*benchmark_xirr_flow_rows, (d, float(benchmark_value))]
             benchmark_xirr_annualized = compute_xirr_annualized(benchmark_xirr_flows)
             if benchmark_xirr_annualized is not None:
                 benchmark_years_elapsed = _years_between(first_cashflow_day, d)
@@ -524,8 +566,7 @@ def compute_portfolio_performance(
                 twr_factor *= gross
         day_mwr_cum_return: Optional[float] = None
         if first_cashflow_day is not None and d in mwr_anchor_days:
-            day_xirr_flows = sorted(xirr_cashflows_by_day.items(), key=lambda x: x[0])
-            day_xirr_flows.append((d, float(total_value)))
+            day_xirr_flows = [*xirr_flow_rows, (d, float(total_value))]
             day_xirr_annualized = compute_xirr_annualized(day_xirr_flows)
             if day_xirr_annualized is not None:
                 years_elapsed = _years_between(first_cashflow_day, d)
@@ -604,15 +645,14 @@ def compute_portfolio_performance(
         if benchmark_current_value is not None
         else None
     )
-    xirr_cashflows_by_day[end] += current_value
-    xirr_flows = sorted(xirr_cashflows_by_day.items(), key=lambda x: x[0])
+    xirr_flows = [*xirr_flow_rows, (end, float(current_value))]
     mwr_xirr = compute_xirr_annualized(xirr_flows)
     benchmark_mwr_xirr: Optional[float] = None
     if benchmark_current_value is not None:
-        benchmark_xirr_cashflows_by_day[end] += float(benchmark_current_value)
-        benchmark_xirr_flows = sorted(
-            benchmark_xirr_cashflows_by_day.items(), key=lambda x: x[0]
-        )
+        benchmark_xirr_flows = [
+            *benchmark_xirr_flow_rows,
+            (end, float(benchmark_current_value)),
+        ]
         benchmark_mwr_xirr = compute_xirr_annualized(benchmark_xirr_flows)
     if points and mwr_xirr is not None and first_cashflow_day is not None:
         years_elapsed = _years_between(first_cashflow_day, end)
@@ -622,7 +662,7 @@ def compute_portfolio_performance(
         points[-1].benchmark_mwr_cum_return = float(
             _annualized_to_period_return(benchmark_mwr_xirr, benchmark_years_elapsed)
         )
-    return PerformanceResult(
+    result = PerformanceResult(
         points=points,
         missing_price_tickers=sorted(set(missing_price_tickers)),
         net_invested=float(net_invested),
@@ -642,6 +682,7 @@ def compute_portfolio_performance(
             float(benchmark_delta_value) if benchmark_delta_value is not None else None
         ),
     )
+    return result
 
 
 def _years_between(date_from: str, date_to: str) -> float:
