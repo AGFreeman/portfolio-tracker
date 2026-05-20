@@ -1,13 +1,34 @@
 """В какой валюте торгуется тикер / приходит котировка."""
-from typing import Optional, Tuple
+from typing import Optional
 
 from app.db import get_instrument_provider
-from app.services.prices import _detect_provider
+from app.services.prices import _detect_provider, _normalize_currency_code
+
+_DIVERSIFICATION_BUCKETS = frozenset({"RUB", "USD", "EUR"})
+
+
+def bucket_diversification_currency(currency: str) -> str:
+    """Свести ISO-валюту к корзине RUB / USD / EUR для вкладки диверсификации."""
+    c = (currency or "").upper().strip()
+    if c in _DIVERSIFICATION_BUCKETS:
+        return c
+    return "USD"
+
+
+def resolve_quote_currency(ticker: str, live_quote_currency: Optional[str] = None) -> str:
+    """
+    Валюта котировки для оценки и диверсификации: live с провайдера,
+    иначе эвристика по провайдеру/тикеру.
+    """
+    norm = _normalize_currency_code(live_quote_currency)
+    if norm:
+        return norm
+    return infer_quote_currency(ticker)
 
 
 def infer_quote_currency(ticker: str) -> str:
     """
-    Валюта цены: MOEX → RUB; Yahoo/CoinGecko → USD.
+    Валюта цены без live-котировки: MOEX/T-Bank → RUB; CoinGecko → USD; иначе USD.
     """
     prov: Optional[str] = None
     row = get_instrument_provider(ticker)
@@ -15,8 +36,10 @@ def infer_quote_currency(ticker: str) -> str:
         prov = row[0]
     else:
         prov, _ = _detect_provider(ticker)
-    if prov == "moex_iss":
+    if prov in ("moex_iss", "tbank"):
         return "RUB"
+    if prov == "coingecko":
+        return "USD"
     return "USD"
 
 
@@ -34,7 +57,7 @@ def infer_trading_currency(ticker: str) -> str:
     if prov is None:
         prov, _ = _detect_provider(up)
 
-    if prov == "moex_iss":
+    if prov in ("moex_iss", "tbank"):
         return "RUB"
     if prov == "coingecko":
         return "USD"

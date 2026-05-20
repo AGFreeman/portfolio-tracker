@@ -12,7 +12,10 @@ from app.db import (
     list_positions_by_ticker,
 )
 from app.services.fx import convert_amount, format_money
-from app.services.price_currency import infer_quote_currency, infer_trading_currency
+from app.services.price_currency import (
+    bucket_diversification_currency,
+    resolve_quote_currency,
+)
 from app.services.prices import get_app_quotes, normalize_quote_price_for_valuation
 
 
@@ -35,15 +38,16 @@ def _build_context():
 
     value_by_ticker: dict[str, float] = {}
     subclass_by_ticker: dict[str, int] = {}
-    trading_ccy_by_ticker: dict[str, str] = {}
+    quote_ccy_by_ticker: dict[str, str] = {}
     unpriced_tickers: set[str] = set()
 
     for p in positions_ticker:
         q = quotes.get(p.ticker)
         raw_price = q.price if q else None
-        quote_ccy = q.currency if q else infer_quote_currency(p.ticker)
+        live_ccy = q.currency if q else None
+        quote_ccy = resolve_quote_currency(p.ticker, live_ccy)
+        quote_ccy_by_ticker[p.ticker] = quote_ccy
         price = normalize_quote_price_for_valuation(p.ticker, raw_price, quote_ccy)
-        trading_ccy_by_ticker[p.ticker] = infer_trading_currency(p.ticker)
         subclass_by_ticker[p.ticker] = p.asset_subclass_id
         if price is None:
             unpriced_tickers.add(p.ticker)
@@ -74,7 +78,7 @@ def _build_context():
         "subclass_by_id": subclass_by_id,
         "value_by_ticker": value_by_ticker,
         "subclass_by_ticker": subclass_by_ticker,
-        "trading_ccy_by_ticker": trading_ccy_by_ticker,
+        "quote_ccy_by_ticker": quote_ccy_by_ticker,
         "value_by_storage": value_by_storage,
         "total_value": total_value,
         "unpriced_tickers": sorted(unpriced_tickers),
@@ -238,14 +242,16 @@ def _render_by_subclasses(ctx):
 
 
 def _render_by_currency(ctx):
-    st.caption("По торговой валюте тикера (фиксированные корзины: RUB, USD, EUR).")
+    st.caption(
+        "По валюте котировки (как при оценке позиций; корзины RUB, USD, EUR; прочие → USD)."
+    )
     total = ctx["total_value"]
 
     value_by_ccy: dict[str, float] = {"RUB": 0.0, "USD": 0.0, "EUR": 0.0}
     for t, val in ctx["value_by_ticker"].items():
-        ccy = ctx["trading_ccy_by_ticker"].get(t, "USD")
-        if ccy not in value_by_ccy:
-            ccy = "USD"
+        ccy = bucket_diversification_currency(
+            ctx["quote_ccy_by_ticker"].get(t, "USD")
+        )
         value_by_ccy[ccy] += float(val)
 
     rows = []
@@ -269,15 +275,17 @@ def _render_by_currency(ctx):
     map_rows = []
     for t in sorted(ctx["value_by_ticker"].keys()):
         val = float(ctx["value_by_ticker"].get(t, 0.0))
+        quote_ccy = ctx["quote_ccy_by_ticker"].get(t, "USD")
         map_rows.append(
             {
                 "Тикер": t,
-                "Торговая валюта": ctx["trading_ccy_by_ticker"].get(t, "USD"),
+                "Валюта котировки": quote_ccy,
+                "Корзина": bucket_diversification_currency(quote_ccy),
                 f"Текущая стоимость ({ctx['display_ccy']})": format_money(val, ctx["display_ccy"]),
                 "Текущая доля, %": round(_pct(val, total), 3),
             }
         )
-    st.caption("Проверка классификации: тикер -> торговая валюта.")
+    st.caption("Проверка: тикер → валюта котировки → корзина диверсификации.")
     st.dataframe(
         pd.DataFrame(map_rows),
         width="stretch",
