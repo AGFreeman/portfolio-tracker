@@ -27,6 +27,20 @@ MOEX_TICKERS = {
     "TMOS", "SBGB", "SBRB", "TGLD", "TSPX", "TEUS", "TEMS", "GXC", "EFG",
 }
 
+# T-Bank *2 share classes: excluded from priced_ratio (no provider history by design).
+COVERAGE_EXCLUDED_TICKERS = frozenset({
+    "TSPX2",
+    "TECH2",
+    "TEUR2",
+    "TIPO2",
+    "TUSD2",
+})
+
+
+def is_excluded_from_coverage_metric(ticker: str) -> bool:
+    return str(ticker or "").upper().strip() in COVERAGE_EXCLUDED_TICKERS
+
+
 _HTTP = requests.Session()
 _TBANK_FIGI_BY_SYMBOL: Dict[str, tuple] = {}  # SYMBOL -> (figi, currency)
 _TBANK_SSL_VERIFY: Optional[bool] = None  # None=unknown, True/False after first probe
@@ -1001,13 +1015,12 @@ def fetch_historical_quotes(
     if provider == "moex_iss":
         return fetch_historical_prices_moex(symbol, date_from, date_to)
     if provider == "tbank":
-        # Prefer T-Bank candles, fallback to MOEX history by symbol.
-        tbank_hist = fetch_historical_prices_tbank(symbol, date_from, date_to)
-        if tbank_hist:
-            return tbank_hist
         moex_hist = fetch_historical_prices_moex(symbol, date_from, date_to)
-        if moex_hist:
-            return moex_hist
+        tbank_hist = fetch_historical_prices_tbank(symbol, date_from, date_to)
+        if tbank_hist or moex_hist:
+            merged = dict(moex_hist)
+            merged.update(tbank_hist)
+            return merged
         return {}
     if provider == "coingecko":
         cg = fetch_historical_prices_coingecko(symbol, date_from, date_to)

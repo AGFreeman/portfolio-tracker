@@ -3,7 +3,6 @@ import unittest
 
 from app.services.performance import (
     PerformancePoint,
-    _carry_forward_prices,
     compute_period_returns,
     compute_twr_from_daily_values,
     compute_xirr_annualized,
@@ -13,7 +12,6 @@ from app.services.prices import PriceQuote
 
 class TestTwrMath(unittest.TestCase):
     def test_twr_with_cash_flow_adjustment(self):
-        # Day0: 100, Day1: 160 with +50 flow => net market move +10%
         twr = compute_twr_from_daily_values(
             values=[100.0, 160.0],
             cash_flows=[0.0, 50.0],
@@ -28,25 +26,77 @@ class TestTwrMath(unittest.TestCase):
         self.assertAlmostEqual(twr, 0.21, places=6)
 
 
-class TestCarryForward(unittest.TestCase):
-    def test_carry_forward_last_known_price(self):
-        series = {
-            "2026-01-01": PriceQuote(price=100.0, currency="USD"),
-            "2026-01-03": PriceQuote(price=103.0, currency="USD"),
+class TestCoverageExclusion(unittest.TestCase):
+    def test_excluded_tickers_do_not_affect_ratio(self):
+        from app.services.performance import _build_as_of_price_index, _holdings_value_as_of_day
+
+        idx = {
+            "SBER": _build_as_of_price_index(
+                {"2026-05-29": PriceQuote(price=100.0, currency="RUB")}
+            ),
+            "TSPX2": _build_as_of_price_index({}),
         }
-        days = ["2026-01-01", "2026-01-02", "2026-01-03"]
-        out = _carry_forward_prices(series, days)
-        self.assertIn("2026-01-02", out)
-        self.assertAlmostEqual(float(out["2026-01-02"].price or 0.0), 100.0)
-        self.assertAlmostEqual(float(out["2026-01-03"].price or 0.0), 103.0)
+        value, priced_pos, total_pos = _holdings_value_as_of_day(
+            {"SBER": 10.0, "TSPX2": 1000.0},
+            idx,
+            "2026-05-31",
+            "RUB",
+            90.0,
+            0.9,
+        )
+        self.assertAlmostEqual(value, 1000.0)
+        self.assertEqual(priced_pos, 1)
+        self.assertEqual(total_pos, 1)
+
+
+class TestHoldingsValueAsOf(unittest.TestCase):
+    def test_weekend_uses_friday_close(self):
+        from app.services.performance import _build_as_of_price_index, _holdings_value_as_of_day
+
+        series = {
+            "2026-05-29": PriceQuote(price=100.0, currency="RUB"),
+        }
+        idx = {"SBER": _build_as_of_price_index(series)}
+        value, priced_pos, total_pos = _holdings_value_as_of_day(
+            {"SBER": 10.0},
+            idx,
+            "2026-05-31",
+            "RUB",
+            90.0,
+            0.9,
+        )
+        self.assertAlmostEqual(value, 1000.0)
+        self.assertEqual(priced_pos, 1)
+        self.assertEqual(total_pos, 1)
 
 
 class TestPeriodReturns(unittest.TestCase):
     def test_period_helpers_non_empty(self):
         points = [
-            PerformancePoint("2026-01-01", 100.0, 0.0, 0.0, 1.0),
-            PerformancePoint("2026-01-15", 105.0, 0.0, 0.05, 1.0),
-            PerformancePoint("2026-02-01", 110.0, 0.0, 0.10, 1.0),
+            PerformancePoint(
+                "2026-01-01",
+                100.0,
+                0.0,
+                0.0,
+                None,
+                1.0,
+            ),
+            PerformancePoint(
+                "2026-01-15",
+                105.0,
+                0.0,
+                0.05,
+                None,
+                1.0,
+            ),
+            PerformancePoint(
+                "2026-02-01",
+                110.0,
+                0.0,
+                0.10,
+                None,
+                1.0,
+            ),
         ]
         ret = compute_period_returns(points)
         self.assertIn("1M", ret)
@@ -57,7 +107,6 @@ class TestPeriodReturns(unittest.TestCase):
 
 class TestXirr(unittest.TestCase):
     def test_xirr_known_case(self):
-        # -1000 today, +1100 in 1 year -> 10% annualized.
         xirr = compute_xirr_annualized(
             [
                 ("2025-01-01", -1000.0),

@@ -24,8 +24,6 @@ from app.ui.rebalancing import render_rebalancing
 from app.ui.performance import render_performance, render_performance_top_metrics
 from app.ui.diversification import render_diversification
 from app.ui.cash_flows import render_cash_flows
-from app.services.performance import refresh_today_historical_quotes
-
 st.set_page_config(page_title="Портфель", layout="wide")
 # Per-rerun snapshot for quote guardrail (avoid repeated list_positions_by_ticker).
 st.session_state.pop("_active_portfolio_tickers", None)
@@ -39,13 +37,6 @@ reconcile_asset_class_targets()
 
 with st.sidebar:
     render_currency_sidebar()
-    # One refresh per enable: toggle resets the flag; runs here (not in the toggle handler).
-    if bool(st.session_state.get("live_price_updates_enabled", False)) and not bool(
-        st.session_state.get("historical_quotes_today_refreshed_once", False)
-    ):
-        with st.spinner("Обновление сегодняшних котировок…"):
-            refresh_today_historical_quotes()
-        st.session_state["historical_quotes_today_refreshed_once"] = True
     st.divider()
     st.header("Действия")
     st.caption(

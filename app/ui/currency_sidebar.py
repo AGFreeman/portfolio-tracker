@@ -85,8 +85,6 @@ def render_currency_sidebar():
     curr_live = bool(st.session_state.get("live_price_updates_enabled", False))
     if curr_live != prev_live:
         request_quotes_refresh()
-        if curr_live:
-            st.session_state["historical_quotes_today_refreshed_once"] = False
         st.session_state["_prev_live_price_updates_enabled"] = curr_live
     if st.button("Force price update", key="force_price_update_now"):
         rub, eur, source, err = fetch_usd_cross_rates()
@@ -98,7 +96,6 @@ def render_currency_sidebar():
             "err": err,
         }
         request_quotes_refresh()
-        st.session_state["historical_quotes_today_refreshed_once"] = False
         st.rerun()
 
     render_fx_live_block()

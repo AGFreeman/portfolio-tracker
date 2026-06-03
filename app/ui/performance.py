@@ -6,7 +6,11 @@ from pathlib import Path
 
 from app.db import list_positions_by_ticker
 from app.services.fx import format_money
-from app.services.prices import get_app_quotes, normalize_quote_price_for_valuation
+from app.services.prices import (
+    get_app_quotes,
+    get_quotes_cache_meta,
+    normalize_quote_price_for_valuation,
+)
 from app.services.performance import (
     compute_benchmark_period_returns,
     compute_period_returns,
@@ -132,8 +136,8 @@ def _filter_chart_df_by_frequency(
         month_end_mask = df["date"].dt.to_period("M") != df["date"].shift(
             -1
         ).dt.to_period("M")
-        return df[month_end_mask]
-    if freq == "weekly":
+        filtered = df[month_end_mask]
+    elif freq == "weekly":
         curr_week = (
             df["date"].dt.isocalendar().year.astype(str)
             + "-"
@@ -141,8 +145,13 @@ def _filter_chart_df_by_frequency(
         )
         next_week = curr_week.shift(-1)
         week_end_mask = curr_week != next_week
-        return df[week_end_mask]
-    return df
+        filtered = df[week_end_mask]
+    else:
+        filtered = df
+    last_row = df.iloc[[-1]]
+    if filtered.empty or filtered["date"].iloc[-1] != last_row["date"].iloc[0]:
+        filtered = pd.concat([filtered, last_row], ignore_index=True)
+    return filtered.drop_duplicates(subset=["date"], keep="last").sort_values("date")
 
 
 @st.cache_data(show_spinner=False)
@@ -152,8 +161,9 @@ def _compute_portfolio_performance_cached(
     eur_per_usd: float,
     mwr_curve_frequency: str,
     db_mtime: float,
+    quotes_cache_ts: int,
 ):
-    _ = db_mtime  # cache key invalidation on local DB updates
+    _ = (db_mtime, quotes_cache_ts)  # cache invalidation on DB / live quotes updates
     return compute_portfolio_performance(
         display_currency=display_currency,
         rub_per_usd=rub_per_usd,
@@ -166,12 +176,19 @@ def _perf_session_cache_key(
     display_currency: str,
     mwr_curve_frequency: str,
     db_mtime: float,
+    quotes_cache_ts: int,
 ) -> str:
     """Flat string key — tuple keys in nested dicts are unreliable in Streamlit session_state."""
     ccy = str(display_currency or "RUB").upper()
     freq = str(mwr_curve_frequency or "daily").strip().lower()
     mtime = int(float(db_mtime))
-    return f"portfolio_perf:{ccy}:{freq}:{mtime}"
+    qts = int(quotes_cache_ts)
+    return f"portfolio_perf:{ccy}:{freq}:{mtime}:{qts}"
+
+
+def _quotes_cache_ts() -> int:
+    meta = get_quotes_cache_meta()
+    return int(float(meta.get("ts") or 0))
 
 
 def _get_portfolio_performance(
@@ -182,10 +199,9 @@ def _get_portfolio_performance(
     db_mtime: float,
 ):
     """One heavy compute per rerun per parameter set (Streamlit tabs call this twice)."""
-    # FX and live-toggle are not part of the cache key: historical series uses DB quotes,
-    # and the last point is refreshed via live quotes inside compute_portfolio_performance.
+    quotes_cache_ts = _quotes_cache_ts()
     session_key = _perf_session_cache_key(
-        display_currency, mwr_curve_frequency, db_mtime
+        display_currency, mwr_curve_frequency, db_mtime, quotes_cache_ts
     )
     cached = st.session_state.get(session_key)
     if cached is not None:
@@ -196,6 +212,7 @@ def _get_portfolio_performance(
         eur_per_usd=eur_per_usd,
         mwr_curve_frequency=mwr_curve_frequency,
         db_mtime=db_mtime,
+        quotes_cache_ts=quotes_cache_ts,
     )
     st.session_state[session_key] = result
     return result
@@ -240,8 +257,10 @@ def render_performance() -> None:
         help=(
             "Главная метрика доходности — MWR (XIRR) по датам и объёму денежных потоков. "
             "Учитываются ручные вводы/выводы из раздела Cash Flows. "
-            "Simple Return показывается как дополнительная справочная метрика. "
-            "Стоимость портфеля считается только по инструментам (основной + прочие)."
+            "Исторические котировки кэшируются в базе: при повторном открытии "
+            "страницы в тот же день повторной загрузки с провайдеров нет. "
+            "Simple Return — справочная метрика. "
+            "Стоимость портфеля — только по инструментам (основной + прочие)."
         ),
     )
     display_ccy = st.session_state.get("display_currency", "RUB")
@@ -301,13 +320,20 @@ def render_performance() -> None:
     db_path = Path(__file__).resolve().parents[2] / "data" / "portfolio.db"
     db_mtime = float(db_path.stat().st_mtime) if db_path.exists() else 0.0
 
-    result = _get_portfolio_performance(
-        display_currency=display_ccy,
-        rub_per_usd=rub,
-        eur_per_usd=eur,
-        mwr_curve_frequency=chart_frequency,
-        db_mtime=db_mtime,
+    st.caption(
+        "Исторические котировки читаются только из БД. "
+        "Первичное заполнение: `python scripts/backfill_historical_quotes.py` "
+        "(повторите после новых сделок)."
     )
+
+    with st.spinner("Расчёт доходности…"):
+        result = _get_portfolio_performance(
+            display_currency=display_ccy,
+            rub_per_usd=rub,
+            eur_per_usd=eur,
+            mwr_curve_frequency=chart_frequency,
+            db_mtime=db_mtime,
+        )
     if not result.points:
         st.info("Недостаточно данных: добавьте хотя бы одну сделку.")
         return
@@ -463,13 +489,16 @@ def render_performance() -> None:
         )
 
     low_coverage_days = int((df["priced_ratio"] < 1.0).sum())
-    if result.missing_price_tickers or low_coverage_days > 0:
+    recent_low_coverage = int((df.tail(7)["priced_ratio"] < 1.0).sum())
+    if result.missing_price_tickers or recent_low_coverage > 0:
         warn = []
         if result.missing_price_tickers:
             warn.append(
                 "Нет исторических котировок для: "
                 + ", ".join(sorted(result.missing_price_tickers))
             )
-        if low_coverage_days > 0:
-            warn.append(f"Дней с неполным покрытием цен: {low_coverage_days}")
+        if recent_low_coverage > 0:
+            warn.append(
+                f"Дней с неполным покрытием цен (последние 7): {recent_low_coverage}"
+            )
         st.warning(" | ".join(warn))

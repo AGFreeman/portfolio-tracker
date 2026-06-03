@@ -323,6 +323,54 @@ def delete_cash_flow(flow_id: int) -> None:
         conn.close()
 
 
+def _migrate_nbis_transactions_to_yndx(conn: sqlite3.Connection) -> None:
+    """
+    Broker import labeled pre-2024 Yandex as NBIS; MOEX ticker was YNDX.
+    Rename transactions/quotes/instruments and drop the stray NBIS instrument row.
+    """
+    has_nbis_tx = conn.execute(
+        "SELECT 1 FROM transactions WHERE ticker = 'NBIS' LIMIT 1"
+    ).fetchone()
+    if not has_nbis_tx:
+        return
+
+    nbis_inst = conn.execute(
+        "SELECT asset_subclass_id, short_name FROM instruments WHERE ticker = 'NBIS' LIMIT 1"
+    ).fetchone()
+
+    conn.execute("UPDATE transactions SET ticker = 'YNDX' WHERE ticker = 'NBIS'")
+    conn.execute("UPDATE historical_quotes SET ticker = 'YNDX' WHERE ticker = 'NBIS'")
+
+    yndx_exists = conn.execute(
+        "SELECT 1 FROM instruments WHERE ticker = 'YNDX' LIMIT 1"
+    ).fetchone()
+    subclass_id = nbis_inst["asset_subclass_id"] if nbis_inst else None
+    if yndx_exists:
+        conn.execute(
+            """
+            UPDATE instruments
+            SET provider = 'moex_iss',
+                provider_symbol = 'YNDX',
+                short_name = 'Yandex N.V. (MOEX YNDX)',
+                isin = 'NL0009805522',
+                asset_subclass_id = COALESCE(asset_subclass_id, ?)
+            WHERE ticker = 'YNDX'
+            """,
+            (subclass_id,),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO instruments (ticker, provider, provider_symbol, short_name, isin, asset_subclass_id)
+            VALUES ('YNDX', 'moex_iss', 'YNDX', 'Yandex N.V. (MOEX YNDX)', 'NL0009805522', ?)
+            """,
+            (subclass_id,),
+        )
+
+    conn.execute("DELETE FROM instruments WHERE ticker = 'NBIS'")
+    conn.commit()
+
+
 def init_db():
     conn = get_conn()
     try:
@@ -374,7 +422,18 @@ def init_db():
                 flow_date TEXT NOT NULL,
                 CHECK (amount != 0)
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """
+        )
+        conn.commit()
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS app_settings (
+                   key TEXT PRIMARY KEY,
+                   value TEXT NOT NULL
+               )"""
         )
         conn.commit()
         # Стартовые места хранения (IB, Тинькофф, кошельки…) + колонка storage_id у сделок
@@ -446,6 +505,7 @@ def init_db():
         _migrate_legacy_ticker_blocks_to_storage(conn)
         _migrate_legacy_instruments_main_to_portfolio(conn)
         _drop_legacy_block_columns_from_instruments(conn)
+        _migrate_nbis_transactions_to_yndx(conn)
         # Rename legacy table if it still exists from older schema name.
         has_legacy_cf = conn.execute(
             f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{_LEGACY_CASH_FLOWS_TABLE}' LIMIT 1"
@@ -1580,9 +1640,106 @@ def upsert_historical_quote(
         conn.close()
 
 
+def _ensure_app_settings_table(conn) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS app_settings (
+               key TEXT PRIMARY KEY,
+               value TEXT NOT NULL
+           )"""
+    )
+
+
+def get_app_setting(key: str) -> Optional[str]:
+    conn = get_conn()
+    try:
+        _ensure_app_settings_table(conn)
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (str(key),),
+        ).fetchone()
+        return str(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def set_app_setting(key: str, value: str) -> None:
+    conn = get_conn()
+    try:
+        _ensure_app_settings_table(conn)
+        conn.execute(
+            """INSERT INTO app_settings (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (str(key), str(value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_historical_quotes_in_range(
+    ticker: str,
+    date_from: str,
+    date_to: str,
+) -> int:
+    """Delete cached quotes for ticker in inclusive date range."""
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """DELETE FROM historical_quotes
+               WHERE ticker = ? AND quote_date >= ? AND quote_date <= ?""",
+            (str(ticker or "").strip().upper(), str(date_from), str(date_to)),
+        )
+        conn.commit()
+        return int(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def insert_historical_quotes_ignore_existing(rows: List[tuple]) -> int:
+    """
+    Insert historical quotes only for dates not yet in DB (immutable history).
+    Row format: (ticker, quote_date, price, currency)
+    """
+    if not rows:
+        return 0
+    normalized_rows = []
+    for row in rows:
+        if len(row) == 4:
+            t, d, pr, c = row
+        elif len(row) == 6:
+            t, d, _provider, _provider_symbol, pr, c = row
+        else:
+            raise ValueError("invalid historical quote row format")
+        if pr is None:
+            continue
+        normalized_rows.append(
+            (
+                str(t).strip().upper(),
+                str(d),
+                float(pr),
+                str(c).upper(),
+            )
+        )
+    if not normalized_rows:
+        return 0
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """INSERT OR IGNORE INTO historical_quotes (
+                   ticker, quote_date, price, currency, updated_at
+               )
+               VALUES (?, ?, ?, ?, datetime('now','localtime'))""",
+            normalized_rows,
+        )
+        conn.commit()
+        return max(0, int(conn.total_changes))
+    finally:
+        conn.close()
+
+
 def upsert_historical_quotes_bulk(rows: List[tuple]) -> None:
     """
-    Bulk upsert historical quotes.
+    Bulk upsert historical quotes (overwrites existing rows — use for today's live refresh).
     Row format (new): (ticker, quote_date, price, currency)
     Backward-compatible old row format: (ticker, quote_date, provider, provider_symbol, price, currency)
     """

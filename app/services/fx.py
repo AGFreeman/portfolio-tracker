@@ -79,6 +79,31 @@ def get_historical_usd_cross_rates(
     return out
 
 
+def get_historical_usd_cross_rates_exact(
+    date_from: str,
+    date_to: str,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Return FX only on dates with market quotes (no carry-forward).
+    Used by performance valuation; gaps filled from last full portfolio revaluation day.
+    """
+    from app.services.prices import fetch_historical_prices_yfinance
+
+    usdrub_raw = fetch_historical_prices_yfinance("USDRUB=X", date_from, date_to)
+    eurusd_raw = fetch_historical_prices_yfinance("EURUSD=X", date_from, date_to)
+    out: Dict[str, Tuple[float, float]] = {}
+    for d, q in usdrub_raw.items():
+        if q is None or q.price is None or float(q.price) <= 0:
+            continue
+        rub = float(q.price)
+        eur_q = eurusd_raw.get(d)
+        if eur_q is None or eur_q.price is None or float(eur_q.price) <= 0:
+            continue
+        eur = 1.0 / float(eur_q.price)
+        out[d] = (rub, eur)
+    return out
+
+
 def _fetch_yahoo_pair_rate(symbol: str) -> Optional[float]:
     """Возвращает последний close для Yahoo пары, например USDRUB=X."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"

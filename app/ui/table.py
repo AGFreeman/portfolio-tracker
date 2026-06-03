@@ -64,15 +64,6 @@ def _render_portfolio_total_metric_body():
     positions = list_positions_by_ticker()
     display_ccy = st.session_state.get("display_currency", "RUB")
     if not positions:
-        st.session_state["portfolio_total"] = {
-            "currency": display_ccy,
-            "total": 0.0,
-            "main_total": 0.0,
-            "other_total": 0.0,
-            "blocked_total": 0.0,
-            "priced": 0,
-            "total_tickers": 0,
-        }
         c1, c2, c3, c4 = st.columns(4)
         c1.metric(f"Стоимость портфеля ({display_ccy})", "—")
         c2.metric(f"Основной ({display_ccy})", "—")
@@ -113,15 +104,6 @@ def _render_portfolio_total_metric_body():
             other_total += value_disp
         n_with_price += 1
 
-    st.session_state["portfolio_total"] = {
-        "currency": display_ccy,
-        "total": portfolio_total,
-        "main_total": main_total,
-        "other_total": other_total,
-        "blocked_total": blocked_total,
-        "priced": n_with_price,
-        "total_tickers": len(positions),
-    }
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
         f"Стоимость портфеля ({display_ccy})",
@@ -148,14 +130,6 @@ def _render_portfolio_total_metric_body():
 def _render_portfolio_table_body():
     positions = list_positions_by_ticker()
     if not positions:
-        st.session_state["portfolio_total"] = {
-            "currency": st.session_state.get("display_currency", "RUB"),
-            "total": 0.0,
-            "main_total": 0.0,
-            "other_total": 0.0,
-            "priced": 0,
-            "total_tickers": 0,
-        }
         st.info("Нет позиций. Добавьте позиции в боковой панели.")
         return
 
@@ -265,15 +239,6 @@ def _render_portfolio_table_body():
     for r in other_rows:
         r.pop("_class_sort", None)
         r.pop("_subclass_sort", None)
-
-    st.session_state["portfolio_total"] = {
-        "currency": display_ccy,
-        "total": portfolio_total,
-        "main_total": main_total,
-        "other_total": other_total,
-        "priced": n_with_price,
-        "total_tickers": len(positions),
-    }
 
     table_help = (
         f"Цены и стоимость в {display_ccy}; "

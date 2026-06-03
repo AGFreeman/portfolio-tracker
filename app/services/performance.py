@@ -1,23 +1,24 @@
 """Portfolio performance engine: daily valuation + TWR with historical backfill."""
 from __future__ import annotations
 
+import json
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Mapping, Optional, Tuple
 
 from app.db import (
+    get_app_setting,
     list_cash_flows,
-    list_positions_by_ticker,
     list_transactions,
     list_cached_historical_quotes,
-    upsert_historical_quotes_bulk,
 )
-from app.services.fx import convert_amount, get_historical_usd_cross_rates
+from app.services.fx import convert_amount
 from app.services.prices import (
     PriceQuote,
-    fetch_historical_quotes,
     build_provider_overrides,
+    is_excluded_from_coverage_metric,
     normalize_quote_price_for_valuation,
 )
 
@@ -64,68 +65,6 @@ def _get_money_market_benchmark_for_currency(display_currency: str) -> Optional[
     if not ccy:
         return None
     return _DEFAULT_MONEY_MARKET_BENCHMARKS.get(ccy)
-
-
-# Key rate timeline (Bank of Russia), decimal annual rates.
-# Used only for synthetic LQDT backfill before first market quote.
-_CBR_KEY_RATE_TIMELINE: List[Tuple[str, float]] = [
-    ("2021-01-01", 0.0425),
-    ("2021-03-22", 0.0450),
-    ("2021-04-26", 0.0500),
-    ("2021-06-15", 0.0550),
-    ("2021-07-26", 0.0650),
-    ("2021-09-13", 0.0675),
-    ("2021-10-25", 0.0750),
-    ("2021-12-20", 0.0850),
-    ("2022-02-14", 0.0950),
-    ("2022-02-28", 0.2000),
-    ("2022-04-11", 0.1700),
-    ("2022-05-04", 0.1400),
-    ("2022-05-27", 0.1100),
-    ("2022-06-14", 0.0950),
-    ("2022-07-25", 0.0800),
-]
-
-
-def _cbr_key_rate_for_day(day_iso: str) -> float:
-    chosen = _CBR_KEY_RATE_TIMELINE[0][1]
-    for start_day, rate in _CBR_KEY_RATE_TIMELINE:
-        if day_iso >= start_day:
-            chosen = rate
-        else:
-            break
-    return float(chosen)
-
-
-def _build_lqdt_synthetic_history_before_anchor(
-    date_from: str,
-    anchor_date: str,
-    anchor_price: float,
-) -> Dict[str, PriceQuote]:
-    """
-    Build synthetic RUB LQDT prices before first known market quote using CBR key rate.
-    Reverse compounding:
-      P(d) = P(d+1) / (1 + r_day)
-    where r_day is effective daily rate from annual key rate.
-    """
-    out: Dict[str, PriceQuote] = {}
-    start_dt = datetime.strptime(date_from, "%Y-%m-%d").date()
-    anchor_dt = datetime.strptime(anchor_date, "%Y-%m-%d").date()
-    if anchor_dt <= start_dt:
-        return out
-    curr_price = float(anchor_price)
-    d = anchor_dt - timedelta(days=1)
-    while d >= start_dt:
-        day_iso = d.isoformat()
-        annual = _cbr_key_rate_for_day(day_iso)
-        daily = (1.0 + float(annual)) ** (1.0 / 365.0) - 1.0
-        denom = 1.0 + daily
-        if denom <= 0:
-            break
-        curr_price = curr_price / denom
-        out[day_iso] = PriceQuote(price=float(curr_price), currency="RUB")
-        d = d - timedelta(days=1)
-    return out
 
 
 def _append_dated_cashflow(
@@ -197,55 +136,105 @@ def _load_daily_manual_cash_flows(
     return flows_by_day, min(dates), max(dates)
 
 
-def _load_price_series_with_cache(
+_HISTORICAL_FX_SETTING_KEY = "historical_fx_v1"
+
+
+def _load_fx_exact_from_db(date_from: str, date_to: str) -> Dict[str, Tuple[float, float]]:
+    """Load pre-built FX series from app_settings (filled by backfill script)."""
+    raw = get_app_setting(_HISTORICAL_FX_SETTING_KEY)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    out: Dict[str, Tuple[float, float]] = {}
+    for day, pair in data.items():
+        if not (date_from <= str(day) <= date_to):
+            continue
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        rub, eur = float(pair[0]), float(pair[1])
+        if rub > 0 and eur > 0:
+            out[str(day)] = (rub, eur)
+    return out
+
+
+def _load_price_series_from_cache(
     ticker: str,
     date_from: str,
     date_to: str,
-    provider: str,
-    provider_symbol: str,
-    allow_fetch_missing: bool = True,
-    force_refresh_range: bool = True,
 ) -> Dict[str, PriceQuote]:
-    cached_rows = list_cached_historical_quotes(ticker, date_from, date_to)
+    """Read historical quotes from DB only (no network)."""
     series: Dict[str, PriceQuote] = {}
-    for d, p, ccy in cached_rows:
+    for d, p, ccy in list_cached_historical_quotes(ticker, date_from, date_to):
         series[d] = PriceQuote(price=p, currency=ccy)
-    requested_days = set(_iter_dates(date_from, date_to))
-    missing_days = sorted(d for d in requested_days if d not in series)
-    provider_force_refresh = (
-        force_refresh_range
-        and (provider or "").strip().lower() in ("moex_iss", "tbank")
-    )
-
-    if (missing_days or provider_force_refresh) and allow_fetch_missing:
-        fetched = fetch_historical_quotes(
-            ticker=ticker,
-            date_from=date_from,
-            date_to=date_to,
-            provider_override=provider,
-            provider_symbol_override=provider_symbol,
-        )
-        if fetched:
-            to_upsert = []
-            for d, q in fetched.items():
-                to_upsert.append((ticker, d, q.price, q.currency))
-                series[d] = q
-            upsert_historical_quotes_bulk(to_upsert)
     return series
 
 
-def _carry_forward_prices(series: Dict[str, PriceQuote], dates: List[str]) -> Dict[str, PriceQuote]:
-    out: Dict[str, PriceQuote] = {}
-    last: Optional[PriceQuote] = None
-    for d in dates:
-        q = series.get(d)
-        if q and q.price is not None:
-            last = q
-            out[d] = q
+def _build_as_of_price_index(
+    series: Mapping[str, PriceQuote],
+) -> Tuple[List[str], List[PriceQuote]]:
+    """Sorted trading-day quotes for bisect lookup (last quote on or before day D)."""
+    dates = sorted(series.keys())
+    return dates, [series[d] for d in dates]
+
+
+def _quote_as_of(
+    dates: List[str],
+    quotes: List[PriceQuote],
+    day: str,
+) -> Optional[PriceQuote]:
+    if not dates:
+        return None
+    idx = bisect_right(dates, day) - 1
+    if idx < 0:
+        return None
+    q = quotes[idx]
+    if q.price is None:
+        return None
+    return q
+
+
+def _holdings_value_as_of_day(
+    holdings: Mapping[str, float],
+    as_of_index_by_ticker: Mapping[str, Tuple[List[str], List[PriceQuote]]],
+    day: str,
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Tuple[float, int, int]:
+    """Sum holdings using the latest available quote on or before `day` per ticker."""
+    total_value = 0.0
+    total_pos = 0
+    priced_pos = 0
+    for ticker, amount in holdings.items():
+        if float(amount) <= 0:
             continue
-        if last is not None:
-            out[d] = PriceQuote(price=last.price, currency=last.currency)
-    return out
+        dates, quotes = as_of_index_by_ticker.get(ticker, ([], []))
+        q = _quote_as_of(dates, quotes, day)
+        if is_excluded_from_coverage_metric(ticker):
+            if q is not None:
+                total_value += convert_amount(
+                    amount=float(amount) * float(q.price),
+                    from_ccy=q.currency,
+                    to_ccy=display_currency,
+                    rub_per_usd=rub_per_usd,
+                    eur_per_usd=eur_per_usd,
+                )
+            continue
+        total_pos += 1
+        if q is None:
+            continue
+        total_value += convert_amount(
+            amount=float(amount) * float(q.price),
+            from_ccy=q.currency,
+            to_ccy=display_currency,
+            rub_per_usd=rub_per_usd,
+            eur_per_usd=eur_per_usd,
+        )
+        priced_pos += 1
+    return float(total_value), priced_pos, total_pos
 
 
 def _build_active_intervals_by_ticker(
@@ -279,63 +268,46 @@ def _build_active_intervals_by_ticker(
     return intervals
 
 
-def refresh_today_historical_quotes(force: bool = False) -> int:
-    """
-    Refresh historical_quotes only for current date and only active portfolio tickers.
-    Triggered by live price refresh controls and Force price update (not on cold startup).
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    today = date.today().isoformat()
-    positions = list_positions_by_ticker()
-    tickers = sorted(
-        {
-            str(p.ticker or "").upper().strip()
-            for p in positions
-            if str(p.ticker or "").strip() and float(p.amount or 0) > 0
-        }
-    )
-    if not tickers:
-        return 0
-    provider_overrides: Dict[str, Tuple[str, str]] = build_provider_overrides(tickers)
-    rows_to_upsert: List[tuple] = []
-    tickers_to_fetch: List[str] = []
-    for ticker in tickers:
-        if not force:
-            cached = list_cached_historical_quotes(ticker, today, today)
-            if cached and cached[0][1] is not None:
-                continue
-        tickers_to_fetch.append(ticker)
-
-    def _fetch_today_row(ticker: str) -> Optional[tuple]:
-        if ticker in provider_overrides:
-            prov, sym = provider_overrides[ticker]
-        else:
-            from app.services.prices import _detect_provider
-
-            prov, sym = _detect_provider(ticker)
-        fetched = fetch_historical_quotes(
-            ticker=ticker,
-            date_from=today,
-            date_to=today,
-            provider_override=prov,
-            provider_symbol_override=sym,
+def _sum_holdings_market_value(
+    holdings: Mapping[str, float],
+    quotes: Mapping[str, PriceQuote],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Tuple[float, int, int]:
+    """Sum position values using live quotes (same rules as portfolio summary header)."""
+    total_value = 0.0
+    total_pos = 0
+    priced_pos = 0
+    for ticker, amount in holdings.items():
+        if float(amount) <= 0:
+            continue
+        q = quotes.get(ticker)
+        q_price = None
+        if q is not None and q.price is not None:
+            q_price = normalize_quote_price_for_valuation(ticker, q.price, q.currency)
+        if is_excluded_from_coverage_metric(ticker):
+            if q_price is not None:
+                total_value += convert_amount(
+                    amount=float(amount) * float(q_price),
+                    from_ccy=q.currency,
+                    to_ccy=display_currency,
+                    rub_per_usd=rub_per_usd,
+                    eur_per_usd=eur_per_usd,
+                )
+            continue
+        total_pos += 1
+        if q_price is None:
+            continue
+        total_value += convert_amount(
+            amount=float(amount) * float(q_price),
+            from_ccy=q.currency,
+            to_ccy=display_currency,
+            rub_per_usd=rub_per_usd,
+            eur_per_usd=eur_per_usd,
         )
-        q = fetched.get(today)
-        if q is None:
-            return None
-        return (ticker, today, q.price, q.currency)
-
-    if tickers_to_fetch:
-        workers = max(1, min(12, len(tickers_to_fetch)))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(_fetch_today_row, t): t for t in tickers_to_fetch}
-            for fut in as_completed(futures):
-                row = fut.result()
-                if row:
-                    rows_to_upsert.append(row)
-    upsert_historical_quotes_bulk(rows_to_upsert)
-    return len(rows_to_upsert)
+        priced_pos += 1
+    return float(total_value), priced_pos, total_pos
 
 
 def _normalize_price_series(
@@ -378,87 +350,35 @@ def compute_portfolio_performance(
     start = min(start_candidates) if start_candidates else date.today().isoformat()
     end = date.today().isoformat()
     days = _iter_dates(start, end)
-    fx_by_day = get_historical_usd_cross_rates(
-        date_from=start,
-        date_to=end,
-        fallback_rub_per_usd=rub_per_usd,
-        fallback_eur_per_usd=eur_per_usd,
-    )
+    fx_exact = _load_fx_exact_from_db(start, end)
+    all_tickers = sorted({t for day_rows in tx_by_day.values() for t, _amount, _tx_type in day_rows})
+    active_intervals_by_ticker = _build_active_intervals_by_ticker(tx_by_day, days) if days else {}
+
     benchmark_cfg = _get_money_market_benchmark_for_currency(display_currency)
     benchmark_ticker: Optional[str] = None
     benchmark_prices: Dict[str, PriceQuote] = {}
     if benchmark_cfg is not None:
         benchmark_ticker = benchmark_cfg
-        benchmark_provider_overrides = build_provider_overrides([benchmark_ticker])
-        if benchmark_ticker in benchmark_provider_overrides:
-            benchmark_provider, benchmark_symbol = benchmark_provider_overrides[benchmark_ticker]
-        else:
-            from app.services.prices import _detect_provider
-
-            benchmark_provider, benchmark_symbol = _detect_provider(benchmark_ticker)
-        benchmark_raw = _load_price_series_with_cache(
-            benchmark_ticker,
-            start,
-            end,
-            benchmark_provider,
-            benchmark_symbol,
-            allow_fetch_missing=True,
-            force_refresh_range=False,
-        )
-        # Defensive filter: benchmark should stay in one quote currency.
-        # Mixed cached rows from different providers (e.g. RUB + USD for same ticker)
-        # create artificial spikes and drawdowns.
+        benchmark_raw = _load_price_series_from_cache(benchmark_ticker, start, end)
         benchmark_raw = {
             d: q
             for d, q in benchmark_raw.items()
             if str(q.currency or "").upper() == str(display_currency or "").upper()
         }
-        if benchmark_ticker == "LQDT" and str(display_currency or "").upper() == "RUB" and benchmark_raw:
-            anchor_date = min(benchmark_raw.keys())
-            anchor_quote = benchmark_raw.get(anchor_date)
-            if anchor_quote is not None and anchor_quote.price is not None and anchor_date > start:
-                synthetic = _build_lqdt_synthetic_history_before_anchor(
-                    date_from=start,
-                    anchor_date=anchor_date,
-                    anchor_price=float(anchor_quote.price),
-                )
-                benchmark_raw.update(synthetic)
-        benchmark_prices = _carry_forward_prices(benchmark_raw, days)
-    all_tickers = sorted({t for day_rows in tx_by_day.values() for t, _amount, _tx_type in day_rows})
-    active_intervals_by_ticker = _build_active_intervals_by_ticker(tx_by_day, days) if days else {}
-    provider_overrides: Dict[str, Tuple[str, str]] = build_provider_overrides(all_tickers)
+        benchmark_prices = _normalize_price_series(benchmark_ticker, benchmark_raw)
 
     prices_by_ticker: Dict[str, Dict[str, PriceQuote]] = {}
+    as_of_index_by_ticker: Dict[str, Tuple[List[str], List[PriceQuote]]] = {}
     missing_price_tickers: List[str] = []
     for t in all_tickers:
-        if t in provider_overrides:
-            prov, sym = provider_overrides[t]
-        else:
-            from app.services.prices import _detect_provider
-
-            prov, sym = _detect_provider(t)
         ticker_series: Dict[str, PriceQuote] = {}
         intervals = active_intervals_by_ticker.get(t, [])
         for i_start, i_end in intervals:
-            interval_days = _iter_dates(i_start, i_end)
-            if not interval_days:
-                continue
-            raw = _load_price_series_with_cache(
-                t,
-                i_start,
-                i_end,
-                prov,
-                sym,
-                allow_fetch_missing=False,
-            )
-            carried = _carry_forward_prices(raw, interval_days)
-            ticker_series.update(carried)
+            ticker_series.update(_load_price_series_from_cache(t, i_start, i_end))
         prices_by_ticker[t] = _normalize_price_series(t, ticker_series)
-        if intervals and not ticker_series:
+        as_of_index_by_ticker[t] = _build_as_of_price_index(prices_by_ticker[t])
+        if intervals and not ticker_series and not is_excluded_from_coverage_metric(t):
             missing_price_tickers.append(t)
-
-    if benchmark_ticker and benchmark_prices:
-        benchmark_prices = _normalize_price_series(benchmark_ticker, benchmark_prices)
 
     holdings: Dict[str, float] = defaultdict(float)
     net_invested = 0.0
@@ -474,10 +394,15 @@ def compute_portfolio_performance(
     benchmark_twr_factor = 1.0
     first_cashflow_day: Optional[str] = None
     mwr_anchor_days = _build_mwr_anchor_days(days, mwr_curve_frequency)
+    recent_fx: Tuple[float, float] = (float(rub_per_usd), float(eur_per_usd))
+    last_full_benchmark_value: Optional[float] = None
 
     for d in days:
         day_tx = tx_by_day.get(d, [])
-        day_rub_per_usd, day_eur_per_usd = fx_by_day.get(d, (rub_per_usd, eur_per_usd))
+        if d in fx_exact:
+            recent_fx = fx_exact[d]
+        day_rub_per_usd, day_eur_per_usd = recent_fx
+
         day_external_cash_flow = 0.0
         for amount, from_ccy in manual_flows_by_day.get(d, []):
             day_external_cash_flow += convert_amount(
@@ -498,30 +423,54 @@ def compute_portfolio_performance(
         for ticker, amount, _tx_type in day_tx:
             holdings[ticker] += amount
 
-        securities_value = 0.0
         total_pos = 0
         priced_pos = 0
-        for ticker, amount in holdings.items():
-            if amount <= 0:
-                continue
-            total_pos += 1
-            q = prices_by_ticker.get(ticker, {}).get(d)
-            if q is None or q.price is None:
-                continue
-            securities_value += convert_amount(
-                amount=float(amount) * float(q.price),
-                from_ccy=q.currency,
-                to_ccy=display_currency,
-                rub_per_usd=day_rub_per_usd,
-                eur_per_usd=day_eur_per_usd,
-            )
-            priced_pos += 1
+        exact_value = 0.0
 
-        total_value = float(securities_value)
+        if d == end:
+            try:
+                from app.services.prices import get_app_quotes
+
+                active_live_tickers = sorted(
+                    t for t, amount in holdings.items() if float(amount) > 0
+                )
+                live_quotes = get_app_quotes(active_live_tickers)
+                exact_value, priced_pos, total_pos = _sum_holdings_market_value(
+                    holdings,
+                    live_quotes,
+                    display_currency,
+                    rub_per_usd,
+                    eur_per_usd,
+                )
+                if priced_pos <= 0:
+                    raise RuntimeError("live quotes unavailable")
+            except Exception:
+                exact_value, priced_pos, total_pos = _holdings_value_as_of_day(
+                    holdings,
+                    as_of_index_by_ticker,
+                    d,
+                    display_currency,
+                    day_rub_per_usd,
+                    day_eur_per_usd,
+                )
+        else:
+            exact_value, priced_pos, total_pos = _holdings_value_as_of_day(
+                holdings,
+                as_of_index_by_ticker,
+                d,
+                display_currency,
+                day_rub_per_usd,
+                day_eur_per_usd,
+            )
+
+        total_value = float(exact_value)
+        priced_ratio = (float(priced_pos) / float(total_pos)) if total_pos > 0 else 1.0
+
         benchmark_value: Optional[float] = None
         benchmark_cum_return: Optional[float] = None
         benchmark_mwr_cum_return: Optional[float] = None
         bq = benchmark_prices.get(d) if benchmark_ticker else None
+        bench_fx = recent_fx
         if bq is not None and bq.price is not None:
             b_price = float(bq.price)
             if b_price > 0:
@@ -530,8 +479,8 @@ def compute_portfolio_performance(
                         amount=float(benchmark_cash_balance),
                         from_ccy=display_currency,
                         to_ccy=bq.currency,
-                        rub_per_usd=day_rub_per_usd,
-                        eur_per_usd=day_eur_per_usd,
+                        rub_per_usd=bench_fx[0],
+                        eur_per_usd=bench_fx[1],
                     )
                     benchmark_units += float(benchmark_cash_in_quote) / float(b_price)
                     benchmark_cash_balance = 0.0
@@ -539,11 +488,15 @@ def compute_portfolio_performance(
                     amount=float(benchmark_units) * float(b_price),
                     from_ccy=bq.currency,
                     to_ccy=display_currency,
-                    rub_per_usd=day_rub_per_usd,
-                    eur_per_usd=day_eur_per_usd,
+                    rub_per_usd=bench_fx[0],
+                    eur_per_usd=bench_fx[1],
                 )
                 prev_benchmark_instrument_value = float(benchmark_value)
-        if benchmark_value is None:
+                last_full_benchmark_value = float(benchmark_value)
+        elif last_full_benchmark_value is not None:
+            benchmark_value = float(last_full_benchmark_value) + float(benchmark_cash_balance)
+            benchmark_cash_balance = 0.0
+        else:
             benchmark_value = float(prev_benchmark_instrument_value) + float(benchmark_cash_balance)
         if prev_benchmark_value is not None and prev_benchmark_value > 0:
             benchmark_gross = (float(benchmark_value) - float(day_external_cash_flow)) / float(prev_benchmark_value)
@@ -579,7 +532,7 @@ def compute_portfolio_performance(
                 net_cash_flow=float(day_external_cash_flow),
                 twr_cum_return=float(twr_factor - 1.0),
                 mwr_cum_return=(float(day_mwr_cum_return) if day_mwr_cum_return is not None else None),
-                priced_ratio=(float(priced_pos) / float(total_pos)) if total_pos > 0 else 1.0,
+                priced_ratio=float(priced_ratio),
                 benchmark_value=float(benchmark_value) if benchmark_ticker else None,
                 benchmark_cum_return=(
                     float(benchmark_cum_return) if benchmark_ticker else None
@@ -601,36 +554,22 @@ def compute_portfolio_performance(
                 t for t, amount in holdings.items() if float(amount) > 0
             )
             live_quotes = get_app_quotes(active_live_tickers)
-            end_rub_per_usd, end_eur_per_usd = fx_by_day.get(end, (rub_per_usd, eur_per_usd))
-            live_value = 0.0
-            live_total_pos = 0
-            live_priced_pos = 0
-            for ticker, amount in holdings.items():
-                if amount <= 0:
-                    continue
-                live_total_pos += 1
-                q = live_quotes.get(ticker)
-                if q is None or q.price is None:
-                    continue
-                q_price = normalize_quote_price_for_valuation(ticker, q.price, q.currency)
-                if q_price is None:
-                    continue
-                live_value += convert_amount(
-                    amount=float(amount) * float(q_price),
-                    from_ccy=q.currency,
-                    to_ccy=display_currency,
-                    rub_per_usd=end_rub_per_usd,
-                    eur_per_usd=end_eur_per_usd,
-                )
-                live_priced_pos += 1
-
-            points[-1].portfolio_value = float(live_value)
-            points[-1].priced_ratio = (
-                (float(live_priced_pos) / float(live_total_pos)) if live_total_pos > 0 else 1.0
+            live_value, live_priced_pos, live_total_pos = _sum_holdings_market_value(
+                holdings,
+                live_quotes,
+                display_currency,
+                rub_per_usd,
+                eur_per_usd,
             )
-            values = [p.portfolio_value for p in points]
-            cash_flows = [p.net_cash_flow for p in points]
-            points[-1].twr_cum_return = float(compute_twr_from_daily_values(values, cash_flows))
+
+            if live_priced_pos > 0:
+                points[-1].portfolio_value = float(live_value)
+                points[-1].priced_ratio = float(live_priced_pos) / float(live_total_pos)
+                values = [p.portfolio_value for p in points]
+                cash_flows = [p.net_cash_flow for p in points]
+                points[-1].twr_cum_return = float(
+                    compute_twr_from_daily_values(values, cash_flows)
+                )
         except Exception:
             # Keep historical-cache based last point if live quotes are unavailable in this context.
             pass
