@@ -40,20 +40,24 @@ def _render_fx_live_block_body():
 
     eur_rub = rub / eur if eur > 0 else 0.0
 
-    st.subheader("Валюта и курсы")
-    if err:
-        st.caption(
-            f"Курсы: ограниченный режим ({err}) · "
-            f"{'автообновление включено' if live_updates_enabled else 'автообновление отключено'}"
-        )
-    else:
-        st.caption(
-            "Курсы к USD · "
-            f"{'автообновление включено' if live_updates_enabled else 'автообновление отключено'}"
-        )
     fx_cache = st.session_state.get("fx_cache") or {"ts": time.time()}
     last_update = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(fx_cache.get("ts") or time.time())))
-    st.caption(f"Источник FX: `{source}` · последнее обновление: `{last_update}`")
+    live_status = (
+        "автообновление включено"
+        if live_updates_enabled
+        else "автообновление отключено"
+    )
+    if err:
+        rates_help = f"Курсы: ограниченный режим ({err}). {live_status}."
+    else:
+        rates_help = f"Курсы к USD. {live_status}."
+    st.subheader(
+        "Валюта и курсы",
+        help=(
+            f"{rates_help} Источник FX: {source}. "
+            f"Последнее обновление: {last_update}."
+        ),
+    )
 
     c1, c2 = st.columns(2)
     with c1:

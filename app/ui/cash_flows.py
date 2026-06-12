@@ -8,6 +8,7 @@ import streamlit as st
 
 from app.db import add_cash_flow, delete_cash_flow, list_cash_flows
 from app.services.fx import convert_amount, format_money
+from app.services.performance import compute_net_cash_flow_total_spot
 
 
 def direction_label(value: float | str) -> str:
@@ -29,14 +30,18 @@ def _cash_flow_totals_display(flows, display_ccy: str, rub: float, eur: float) -
             total_in += v
         else:
             total_out += abs(v)
-    return total_in, total_out, total_in - total_out
+    net = compute_net_cash_flow_total_spot(display_ccy, rub, eur, flows=flows)
+    return total_in, total_out, net
 
 
 def render_cash_flows() -> None:
     """Только таблица вводов/выводов (без форм)."""
-    st.caption(
-        "Пополнения и снятия **в рублях**. Добавить или удалить запись — в боковой панели, блок **«Ввод и вывод»**. "
-        "Итоги ниже пересчитаны в валюту отображения портфеля по курсам в сайдбаре."
+    st.subheader(
+        "Ввод и вывод",
+        help=(
+            "Пополнения и снятия в рублях. Добавить или удалить запись — в боковой панели, блок «Ввод и вывод». "
+            "Итоги ниже пересчитаны в валюту отображения портфеля по курсам в сайдбаре."
+        ),
     )
     flows = list_cash_flows()
     if not flows:
@@ -82,8 +87,10 @@ def render_cash_flows() -> None:
 def render_cash_flow_sidebar() -> None:
     """Форма добавления и удаление записей — только сайдбар."""
     st.divider()
-    st.subheader("Ввод и вывод")
-    st.caption("Суммы только в **₽** (отдельно от сделок по тикерам).")
+    st.subheader(
+        "Ввод и вывод",
+        help="Суммы только в ₽ (отдельно от сделок по тикерам).",
+    )
 
     with st.form("sidebar_cash_flow_form", clear_on_submit=True):
         c1, c2 = st.columns(2)

@@ -38,10 +38,12 @@ reconcile_asset_class_targets()
 with st.sidebar:
     render_currency_sidebar()
     st.divider()
-    st.header("Действия")
-    st.caption(
-        "В **Покупке** место выбирается как тикер (список из базы + «Новое место…»). "
-        "Разбивка по счетам — вкладка **«По местам хранения»**; в «Транзакциях» — колонка **Место хранения**."
+    st.header(
+        "Действия",
+        help=(
+            "В «Покупке» место выбирается из списка базы или «Новое место…». "
+            "Разбивка по счетам — вкладка «По местам хранения»; в «Транзакциях» — колонка «Место хранения»."
+        ),
     )
     add_tab, remove_tab, transfer_tab, ticker_tab, classes_tab = st.tabs(
         ["Покупка", "Продажа", "Перевод", "Тикеры и классы", "Классы активов"]
@@ -79,9 +81,6 @@ with tab_diversification:
 with tab_storage:
     render_storage_allocations()
 with tab_tx:
-    st.caption(
-        "Все операции по дате: покупки, продажи, погашения облигаций, переводы и сплиты (новые сверху)."
-    )
     render_transactions_table()
 with tab_cash:
     render_cash_flows()

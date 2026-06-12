@@ -124,7 +124,13 @@ def _render_grouped_bar(df: pd.DataFrame, index_col: str, y_cols: list[str], key
 
 
 def _render_by_tickers(ctx):
-    st.caption("По тикерам: текущая доля. Цель для тикера показывается, если тикер один в своём подклассе.")
+    st.subheader(
+        "По тикерам",
+        help=(
+            "Текущая доля каждого тикера. "
+            "Цель для тикера показывается, если тикер один в своём подклассе."
+        ),
+    )
 
     total = ctx["total_value"]
     value_by_ticker = ctx["value_by_ticker"]
@@ -242,8 +248,11 @@ def _render_by_subclasses(ctx):
 
 
 def _render_by_currency(ctx):
-    st.caption(
-        "По валюте котировки (как при оценке позиций; корзины RUB, USD, EUR; прочие → USD)."
+    st.subheader(
+        "По валюте активов",
+        help=(
+            "По валюте котировки (как при оценке позиций; корзины RUB, USD, EUR; прочие → USD)."
+        ),
     )
     total = ctx["total_value"]
 
@@ -285,7 +294,10 @@ def _render_by_currency(ctx):
                 "Текущая доля, %": round(_pct(val, total), 3),
             }
         )
-    st.caption("Проверка: тикер → валюта котировки → корзина диверсификации.")
+    st.subheader(
+        "Соответствие тикеров",
+        help="Проверка: тикер → валюта котировки → корзина диверсификации.",
+    )
     st.dataframe(
         pd.DataFrame(map_rows),
         width="stretch",
@@ -320,12 +332,16 @@ def render_diversification():
         st.info("Нет оценённых позиций для расчёта диверсификации.")
         return
 
+    div_help = (
+        "Сравнение текущих долей позиций с целевыми из настроек классов активов."
+    )
     if ctx["unpriced_tickers"]:
-        st.caption(
-            "Без котировки (исключены из долей): **"
-            + "**, **".join(ctx["unpriced_tickers"])
-            + "**."
+        div_help += (
+            " Без котировки (исключены из долей): "
+            + ", ".join(ctx["unpriced_tickers"])
+            + "."
         )
+    st.subheader("Диверсификация", help=div_help)
 
     t1, t2, t3, t4, t5 = st.tabs(
         [

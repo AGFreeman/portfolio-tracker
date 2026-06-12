@@ -94,9 +94,13 @@ def render_storage_allocations_fragment():
 
         rows.append(row)
 
-    st.caption(
-        "По каждому тикеру — **одна строка**; остатки по местам (**Binance**, **Bybit**, **Metamask**, **TrustWallet** — "
-        "дробные, остальные места — **целые штуки**), затем **Всего**."
+    st.subheader(
+        "По местам хранения",
+        help=(
+            "По каждому тикеру — одна строка; остатки по местам "
+            "(Binance, Bybit, Metamask, TrustWallet — дробные; остальные места — целые штуки), "
+            "затем «Всего»."
+        ),
     )
     df = pd.DataFrame(rows, columns=["Тикер", *place_columns, "Всего"])
     styled = _storage_qty_display_styler(df, place_columns)

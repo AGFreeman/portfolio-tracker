@@ -1,8 +1,11 @@
 """Unit tests for portfolio performance helpers."""
 import unittest
 
+from types import SimpleNamespace
+
 from app.services.performance import (
     PerformancePoint,
+    compute_net_cash_flow_total_spot,
     compute_period_returns,
     compute_twr_from_daily_values,
     compute_xirr_annualized,
@@ -15,8 +18,17 @@ class TestTwrMath(unittest.TestCase):
         twr = compute_twr_from_daily_values(
             values=[100.0, 160.0],
             cash_flows=[0.0, 50.0],
+            include_cash_in_value=True,
         )
         self.assertAlmostEqual(twr, 0.10, places=6)
+
+    def test_twr_deposit_invested_same_day(self):
+        twr = compute_twr_from_daily_values(
+            values=[7830.0, 442635.0],
+            cash_flows=[0.0, 444757.0],
+        )
+        expected = 442635.0 / (7830.0 + 444757.0) - 1.0
+        self.assertAlmostEqual(twr, expected, places=6)
 
     def test_twr_without_flows(self):
         twr = compute_twr_from_daily_values(
@@ -103,6 +115,47 @@ class TestPeriodReturns(unittest.TestCase):
         self.assertIn("YTD", ret)
         self.assertIn("ALL", ret)
         self.assertGreaterEqual(ret["ALL"], 0.0)
+
+    def test_all_period_matches_spot_net_invested(self):
+        points = [
+            PerformancePoint(
+                "2026-01-01",
+                100.0,
+                80.0,
+                0.0,
+                None,
+                1.0,
+            ),
+            PerformancePoint(
+                "2026-02-01",
+                120.0,
+                0.0,
+                0.0,
+                None,
+                1.0,
+            ),
+        ]
+        spot_invested = 100.0
+        ret = compute_period_returns(points, net_invested=spot_invested)
+        expected_all = (120.0 / spot_invested) - 1.0
+        self.assertAlmostEqual(ret["ALL"], expected_all, places=6)
+        self.assertNotAlmostEqual(
+            ret["ALL"],
+            (120.0 / 80.0) - 1.0,
+            places=6,
+        )
+
+
+class TestNetCashFlowSpot(unittest.TestCase):
+    def test_converts_rub_flows_to_display_currency_with_spot_fx(self):
+        flows = [
+            SimpleNamespace(amount=100_000.0, currency="RUB"),
+            SimpleNamespace(amount=-10_000.0, currency="RUB"),
+        ]
+        usd_total = compute_net_cash_flow_total_spot("USD", 100.0, 0.9, flows=flows)
+        eur_total = compute_net_cash_flow_total_spot("EUR", 100.0, 0.9, flows=flows)
+        self.assertAlmostEqual(usd_total, 900.0)
+        self.assertAlmostEqual(eur_total, 810.0)
 
 
 class TestXirr(unittest.TestCase):

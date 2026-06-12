@@ -66,6 +66,13 @@ def _group_transfer_pairs(txs):
 
 
 def render_transactions_table():
+    st.subheader(
+        "Транзакции",
+        help=(
+            "Все операции по дате: покупки, продажи, погашения облигаций, "
+            "переводы и сплиты (новые сверху)."
+        ),
+    )
     txs = list_transactions()
     if not txs:
         st.info("Пока нет транзакций.")

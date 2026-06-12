@@ -371,6 +371,67 @@ def _migrate_nbis_transactions_to_yndx(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_ydex_conversion_quote_gap(conn: sqlite3.Connection) -> None:
+    """
+    After YNDX→YDEX conversion, MOEX may start YDEX quotes later than conversion day.
+    Seed one carry-over quote on conversion date from the last YNDX close (1:1 swap).
+    """
+    conv_row = conn.execute(
+        """
+        SELECT MIN(substr(created_at, 1, 10))
+        FROM transactions
+        WHERE ticker = 'YDEX' AND lower(transaction_type) = 'conversion'
+        """
+    ).fetchone()
+    if not conv_row or not conv_row[0]:
+        return
+    conv_date = str(conv_row[0])
+    first_ydex = conn.execute(
+        "SELECT MIN(quote_date) FROM historical_quotes WHERE ticker = 'YDEX'"
+    ).fetchone()
+    if not first_ydex or not first_ydex[0]:
+        return
+    first_ydex_date = str(first_ydex[0])
+    if conv_date >= first_ydex_date:
+        return
+
+    existing = conn.execute(
+        """
+        SELECT 1 FROM historical_quotes
+        WHERE ticker = 'YDEX' AND quote_date >= ? AND quote_date < ?
+        LIMIT 1
+        """,
+        (conv_date, first_ydex_date),
+    ).fetchone()
+    if existing:
+        return
+
+    yndx_row = conn.execute(
+        """
+        SELECT price, currency FROM historical_quotes
+        WHERE ticker = 'YNDX' AND quote_date <= ?
+        ORDER BY quote_date DESC
+        LIMIT 1
+        """,
+        (conv_date,),
+    ).fetchone()
+    if not yndx_row or yndx_row[0] is None:
+        return
+
+    price = float(yndx_row[0])
+    currency = str(yndx_row[1] or "RUB").upper()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO historical_quotes (
+            ticker, quote_date, price, currency, created_at, updated_at
+        )
+        VALUES ('YDEX', ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))
+        """,
+        (conv_date, price, currency),
+    )
+    conn.commit()
+
+
 def init_db():
     conn = get_conn()
     try:
@@ -506,6 +567,7 @@ def init_db():
         _migrate_legacy_instruments_main_to_portfolio(conn)
         _drop_legacy_block_columns_from_instruments(conn)
         _migrate_nbis_transactions_to_yndx(conn)
+        _migrate_ydex_conversion_quote_gap(conn)
         # Rename legacy table if it still exists from older schema name.
         has_legacy_cf = conn.execute(
             f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{_LEGACY_CASH_FLOWS_TABLE}' LIMIT 1"

@@ -13,6 +13,7 @@ from app.db import (
     get_instrument_main_map,
 )
 from app.services.fx import convert_amount, format_money
+from app.services.performance import compute_current_portfolio_market_value
 from app.services.price_currency import infer_quote_currency
 from app.services.prices import (
     get_app_quotes,
@@ -65,10 +66,10 @@ def _render_portfolio_total_metric_body():
     display_ccy = st.session_state.get("display_currency", "RUB")
     if not positions:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric(f"Стоимость портфеля ({display_ccy})", "—")
-        c2.metric(f"Основной ({display_ccy})", "—")
-        c3.metric(f"Прочие ({display_ccy})", "—")
-        c4.metric(f"Заблокировано ({display_ccy})", "—")
+        c1.metric(f"Стоимость портфеля", "—")
+        c2.metric(f"Основной", "—")
+        c3.metric(f"Прочие", "—")
+        c4.metric(f"Заблокировано", "—")
         return
 
     fx = st.session_state.get("fx_cache") or {}
@@ -80,11 +81,12 @@ def _render_portfolio_total_metric_body():
     live_updates_enabled = bool(st.session_state.get("live_price_updates_enabled", False))
     quotes = get_app_quotes(tickers)
 
-    portfolio_total = 0.0
+    portfolio_total, n_with_price, _ = compute_current_portfolio_market_value(
+        display_ccy, rub, eur
+    )
     main_total = 0.0
     other_total = 0.0
     blocked_total = 0.0
-    n_with_price = 0
     blocked_tickers = {t.upper() for t in list_buy_blocked_tickers()}
     for p in positions:
         q = quotes.get(p.ticker)
@@ -95,35 +97,33 @@ def _render_portfolio_total_metric_body():
             continue
         value_native = price * p.amount
         value_disp = convert_amount(value_native, quote_ccy, display_ccy, rub, eur)
-        portfolio_total += value_disp
         if (p.ticker or "").upper() in blocked_tickers:
             blocked_total += value_disp
         if bool(main_by_ticker.get((p.ticker or "").upper(), False)):
             main_total += value_disp
         else:
             other_total += value_disp
-        n_with_price += 1
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
-        f"Стоимость портфеля ({display_ccy})",
+        f"Стоимость портфеля",
         format_money(portfolio_total, display_ccy) if n_with_price > 0 else "—",
         help="Сумма стоимостей позиций по текущим котировкам в выбранной валюте.",
     )
     c2.metric(
-        f"Основной ({display_ccy})",
+        f"Основной портфель",
         format_money(main_total, display_ccy) if n_with_price > 0 else "—",
-        help="Сумма по инструментам с флагом main = 1.",
+        help="Сумма по инструментам основного портфеля.",
     )
     c3.metric(
-        f"Прочие ({display_ccy})",
+        f"Прочие активы",
         format_money(other_total, display_ccy) if n_with_price > 0 else "—",
-        help="Сумма по инструментам с флагом main = 0.",
+        help="Сумма по инструментам прочих активов.",
     )
     c4.metric(
-        f"Заблокировано ({display_ccy})",
+        f"Заблокировано",
         format_money(blocked_total, display_ccy) if n_with_price > 0 else "—",
-        help="Сумма стоимостей инструментов, которые заблокированы для покупок в ребалансировке.",
+        help="Сумма стоимостей заблокированных активов.",
     )
 
 
@@ -146,13 +146,6 @@ def _render_portfolio_table_body():
     quotes = get_app_quotes(tickers)
     meta = get_quotes_cache_meta()
     stale_tickers = set(meta.get("stale_tickers") or [])
-    if live_updates_enabled and meta.get("ts"):
-            q_ts = time.strftime(
-                "%H:%M:%S",
-                time.localtime(float(meta["ts"])),
-            )
-            st.caption(f"Котировки обновлены: {q_ts}")
-
     main_rows = []
     other_rows = []
     portfolio_total = 0.0

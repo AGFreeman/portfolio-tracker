@@ -71,14 +71,16 @@ def render_add_position():
     # Место хранения: selectbox — места из БД + «Новое место…»
     STORAGE_NEW = "__NEW_STORAGE__"
     storage_names = _storage_names_for_ui()
-    st.caption("Места хранения — из локальной базы; новое имя — пункт «Новое место…».")
-
     storage_choice = st.selectbox(
         "Место хранения",
         options=[STORAGE_NEW] + storage_names,
         format_func=lambda x: "Новое место…" if x == STORAGE_NEW else str(x),
         key="add_storage_choice",
-        help="Пустые имена в базе не показываются. Стартовый список мест задаётся в коде (см. DEFAULT_STORAGE_NAMES_ORDERED).",
+        help=(
+            "Места хранения из локальной базы; новое имя — пункт «Новое место…». "
+            "Пустые имена в базе не показываются. "
+            "Стартовый список мест задаётся в коде (см. DEFAULT_STORAGE_NAMES_ORDERED)."
+        ),
     )
     raw_storage: Optional[str] = None
     if storage_choice == STORAGE_NEW:

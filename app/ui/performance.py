@@ -2,6 +2,7 @@
 import plotly.graph_objects as go
 import pandas as pd
 import streamlit as st
+from plotly.subplots import make_subplots
 from pathlib import Path
 
 from app.db import list_positions_by_ticker
@@ -16,26 +17,57 @@ from app.services.performance import (
     compute_period_returns,
     compute_portfolio_performance,
 )
+from app.services.policy_rates import (
+    synthetic_policy_label,
+    uses_synthetic_policy_benchmark,
+)
 
 
 def _fmt_pct(x: float) -> str:
     return f"{x * 100.0:+.2f}%"
 
 
-def _render_plotly_line_chart(
+def _pnl_return_delta(pnl: float, net_invested: float) -> str | None:
+    if net_invested <= 0:
+        return None
+    return _fmt_pct(pnl / net_invested)
+
+
+def _synthetic_benchmark_help_note(result, display_ccy: str) -> str:
+    if (
+        result.benchmark_ticker
+        and uses_synthetic_policy_benchmark(display_ccy)
+        and result.benchmark_first_quote_date
+    ):
+        return (
+            f" Для benchmark `{result.benchmark_ticker}` на период до "
+            f"`{result.benchmark_first_quote_date}` используется синтетическая "
+            f"оценка по {synthetic_policy_label(display_ccy)}."
+        )
+    return ""
+
+
+_PORTFOLIO_LINE = {"width": 2, "color": "#636EFA"}
+_BENCHMARK_LINE = {"width": 2, "dash": "dot", "color": "#EF553B"}
+
+
+def _add_subplot_line_traces(
+    fig: go.Figure,
     df: pd.DataFrame,
+    *,
+    row: int,
+    col: int,
     y_col: str,
-    title: str,
+    benchmark_y_col: str,
     is_percent: bool,
     hover_label: str,
-    y_tick_prefix: str = "",
-    benchmark_y_col: str = "",
-    benchmark_label: str = "Benchmark",
-) -> None:
+    y_tick_prefix: str,
+    benchmark_label: str,
+    show_legend: bool,
+) -> bool:
     plot_df = df[df[y_col].notna()]
     if plot_df.empty:
-        st.caption("Недостаточно данных для графика.")
-        return
+        return False
 
     y_values = plot_df[y_col].astype(float)
     custom_vals = y_values * 100.0 if is_percent else y_values
@@ -46,20 +78,22 @@ def _render_plotly_line_chart(
         + f"{y_tick_prefix}%{{customdata:.2f}}{hover_value_suffix}"
         + "<extra></extra>"
     )
-
-    fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=plot_df["date"],
             y=y_values,
             mode="lines",
-            line={"width": 2},
+            line=_PORTFOLIO_LINE,
             customdata=custom_vals,
             hovertemplate=hover_template,
-            name=title,
-            showlegend=False,
-        )
+            name="Портфель",
+            legendgroup="portfolio",
+            showlegend=show_legend,
+        ),
+        row=row,
+        col=col,
     )
+
     show_benchmark = bool(benchmark_y_col and benchmark_y_col in df.columns)
     if show_benchmark:
         benchmark_df = df[df[benchmark_y_col].notna()]
@@ -73,7 +107,7 @@ def _render_plotly_line_chart(
                     x=benchmark_df["date"],
                     y=benchmark_vals,
                     mode="lines",
-                    line={"width": 2, "dash": "dot"},
+                    line=_BENCHMARK_LINE,
                     customdata=benchmark_custom_vals,
                     hovertemplate=(
                         "Date: %{x|%m-%Y}<br>"
@@ -82,34 +116,109 @@ def _render_plotly_line_chart(
                         + "<extra></extra>"
                     ),
                     name=benchmark_label,
-                    showlegend=True,
-                )
+                    legendgroup="benchmark",
+                    showlegend=show_legend,
+                ),
+                row=row,
+                col=col,
             )
+    return True
+
+
+def _render_performance_charts(
+    df: pd.DataFrame,
+    *,
+    display_ccy: str,
+    benchmark_label: str,
+) -> None:
+    panels = (
+        {
+            "title": "Кривая стоимости",
+            "y_col": "portfolio_value",
+            "benchmark_y_col": "benchmark_value",
+            "is_percent": False,
+            "hover_label": "Портфель",
+            "y_tick_prefix": f"{display_ccy} ",
+        },
+        {
+            "title": "Кумулятивная доходность",
+            "y_col": "twr_cum_return",
+            "benchmark_y_col": "benchmark_cum_return",
+            "is_percent": True,
+            "hover_label": "Портфель",
+            "y_tick_prefix": "",
+        },
+        {
+            "title": "Кумулятивная MWR",
+            "y_col": "mwr_cum_return",
+            "benchmark_y_col": "benchmark_mwr_cum_return",
+            "is_percent": True,
+            "hover_label": "Портфель",
+            "y_tick_prefix": "",
+        },
+    )
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        subplot_titles=[panel["title"] for panel in panels],
+        horizontal_spacing=0.06,
+    )
+    rendered_any = False
+    for col_idx, panel in enumerate(panels, start=1):
+        if _add_subplot_line_traces(
+            fig,
+            df,
+            row=1,
+            col=col_idx,
+            y_col=panel["y_col"],
+            benchmark_y_col=panel["benchmark_y_col"],
+            is_percent=panel["is_percent"],
+            hover_label=panel["hover_label"],
+            y_tick_prefix=panel["y_tick_prefix"],
+            benchmark_label=benchmark_label,
+            show_legend=col_idx == 1,
+        ):
+            rendered_any = True
+        if panel["is_percent"]:
+            fig.update_yaxes(
+                title=None, tickformat=".1%", fixedrange=True, row=1, col=col_idx
+            )
+        else:
+            fig.update_yaxes(
+                title=None,
+                tickprefix=panel["y_tick_prefix"],
+                tickformat=",.0f",
+                fixedrange=True,
+                row=1,
+                col=col_idx,
+            )
+        fig.update_xaxes(
+            title=None,
+            tickformat="%m-%Y",
+            hoverformat="%m-%Y",
+            rangeslider={"visible": False},
+            fixedrange=False,
+            row=1,
+            col=col_idx,
+        )
+
+    if not rendered_any:
+        st.info("Недостаточно данных для графика.")
+        return
+
     fig.update_layout(
-        margin={"l": 8, "r": 8, "t": 32, "b": 8},
-        height=280,
-        title={"text": title, "x": 0.02, "xanchor": "left"},
+        margin={"l": 8, "r": 8, "t": 48, "b": 72},
+        height=300,
         hovermode="x unified",
         dragmode="zoom",
-        legend=(
-            {"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0}
-            if show_benchmark
-            else None
-        ),
+        legend={
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.18,
+            "xanchor": "center",
+            "x": 0.5,
+        },
     )
-    fig.update_xaxes(
-        title=None,
-        tickformat="%m-%Y",
-        hoverformat="%m-%Y",
-        rangeslider={"visible": False},
-        fixedrange=False,
-    )
-    if is_percent:
-        fig.update_yaxes(title=None, tickformat=".1%", fixedrange=True)
-    else:
-        fig.update_yaxes(
-            title=None, tickprefix=y_tick_prefix, tickformat=",.0f", fixedrange=True
-        )
     st.plotly_chart(
         fig,
         width="stretch",
@@ -236,7 +345,6 @@ def render_performance_top_metrics() -> None:
     if not result.points:
         return
 
-    period = compute_period_returns(result.points)
     m1, m2, m3 = st.columns(3)
     m1.metric(
         "MWR (все время)",
@@ -245,10 +353,23 @@ def render_performance_top_metrics() -> None:
             if (result.points and result.points[-1].mwr_cum_return is not None)
             else "—"
         ),
-        help="Money-weighted доходность за весь период наблюдений (не годовая).",
+        help=f"Прибыль на каждый вложенный {display_ccy}.",
     )
-    m2.metric("Return (все время)", _fmt_pct(period["ALL"]))
-    m3.metric(f"P&L ({display_ccy})", format_money(result.total_pnl, display_ccy))
+    m2.metric(
+        "MWR (XIRR)",
+        (
+            _fmt_pct(result.mwr_xirr_annualized)
+            if result.mwr_xirr_annualized is not None
+            else "—"
+        ),
+        help="MWR в % годовых",
+    )
+    m3.metric(
+        "P&L",
+        format_money(result.total_pnl, display_ccy),
+        delta=_pnl_return_delta(result.total_pnl, result.net_invested),
+        help=(f"Простая доходность (стоимость портфеля - инвестированный капитал)."),
+    )
 
 
 def render_performance() -> None:
@@ -256,10 +377,12 @@ def render_performance() -> None:
         "Доходность",
         help=(
             "Главная метрика доходности — MWR (XIRR) по датам и объёму денежных потоков. "
-            "Учитываются ручные вводы/выводы из раздела Cash Flows. "
-            "Исторические котировки кэшируются в базе: при повторном открытии "
+            "Учитываются ручные вводы/выводы из раздела «Деньги». "
+            "Исторические котировки читаются только из БД; при повторном открытии "
             "страницы в тот же день повторной загрузки с провайдеров нет. "
-            "Simple Return — справочная метрика. "
+            "Первичное заполнение: `python scripts/backfill_historical_quotes.py` "
+            "(повторите после новых сделок). "
+            "P&L — простая доходность (стоимость портфеля минус инвестированный капитал). "
             "Стоимость портфеля — только по инструментам (основной + прочие)."
         ),
     )
@@ -301,30 +424,19 @@ def render_performance() -> None:
     freq_label = st.segmented_control(
         "Частота графиков",
         options=["Months", "Weeks", "Days"],
+        format_func=lambda x: (
+            "Месяцы" if x == "Months" else "Недели" if x == "Weeks" else "Дни"
+        ),
         default="Months",
         key="perf_chart_frequency",
-        help=(
-            "Months быстрее, Weeks сбалансировано, Days детальнее (замедляет каждое обновление страницы). "
-            "Применяется ко всем графикам."
-        ),
     )
     chart_frequency = (
         "monthly"
         if freq_label == "Months"
         else ("weekly" if freq_label == "Weeks" else "daily")
     )
-    if chart_frequency == "daily":
-        st.caption(
-            "Режим «Days» пересчитывает MWR на каждый день истории — страница будет загружаться дольше."
-        )
     db_path = Path(__file__).resolve().parents[2] / "data" / "portfolio.db"
     db_mtime = float(db_path.stat().st_mtime) if db_path.exists() else 0.0
-
-    st.caption(
-        "Исторические котировки читаются только из БД. "
-        "Первичное заполнение: `python scripts/backfill_historical_quotes.py` "
-        "(повторите после новых сделок)."
-    )
 
     with st.spinner("Расчёт доходности…"):
         result = _get_portfolio_performance(
@@ -338,6 +450,31 @@ def render_performance() -> None:
         st.info("Недостаточно данных: добавьте хотя бы одну сделку.")
         return
 
+    df = pd.DataFrame(
+        {
+            "date": [p.date for p in result.points],
+            "portfolio_value": [p.portfolio_value for p in result.points],
+            "twr_cum_return": [p.twr_cum_return for p in result.points],
+            "mwr_cum_return": [p.mwr_cum_return for p in result.points],
+            "priced_ratio": [p.priced_ratio for p in result.points],
+            "benchmark_value": [p.benchmark_value for p in result.points],
+            "benchmark_cum_return": [p.benchmark_cum_return for p in result.points],
+            "benchmark_mwr_cum_return": [
+                p.benchmark_mwr_cum_return for p in result.points
+            ],
+        }
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    chart_df = _filter_chart_df_by_frequency(df, chart_frequency)
+    benchmark_help_note = _synthetic_benchmark_help_note(result, display_ccy)
+    _render_performance_charts(
+        chart_df,
+        display_ccy=display_ccy,
+        benchmark_label=f"Бенчмарк ({result.benchmark_ticker})",
+    )
+
+    st.divider()
+
     # Row 1: P&L + benchmark comparison
     benchmark_pnl = (
         float(result.benchmark_current_value) - float(result.net_invested)
@@ -345,20 +482,38 @@ def render_performance() -> None:
         else None
     )
     r1c1, r1c2, r1c3 = st.columns(3)
-    r1c1.metric(f"P&L ({display_ccy})", format_money(result.total_pnl, display_ccy))
+    r1c1.metric(
+        "P&L",
+        format_money(result.total_pnl, display_ccy),
+        delta=_pnl_return_delta(result.total_pnl, result.net_invested),
+        help=(f"Простая доходность (стоимость портфеля - инвестированный капитал)."),
+    )
     r1c2.metric(
-        f"P&L Benchmark ({display_ccy})",
+        f"P&L Бенчмарк",
         format_money(benchmark_pnl, display_ccy) if benchmark_pnl is not None else "—",
+        delta=_pnl_return_delta(benchmark_pnl, result.net_invested),
+        help=(
+            f"Простая доходность бенчмарка ({result.benchmark_ticker}) "
+            f"при тех же вводах/выводах.{benchmark_help_note}"
+            if result.benchmark_ticker
+            else f"Простая доходность бенчмарка при тех же вводах/выводах.{benchmark_help_note}"
+        ),
     )
     r1c3.metric(
-        "Дельта vs бенчмарк",
+        f"Дельта vs Бенчмарк",
         (
             format_money(result.benchmark_delta_value, display_ccy)
             if result.benchmark_delta_value is not None
             else "—"
         ),
-        help="Разница текущей стоимости портфеля и фонда-бенчмарка денежного рынка в валюте отображения.",
+        delta=_pnl_return_delta(result.benchmark_delta_value, result.total_pnl),
+        help=(
+            f"Разница текущей стоимости портфеля и фонда-бенчмарка ({result.benchmark_ticker}) "
+            f"денежного рынка в {display_ccy}.{benchmark_help_note}"
+        ),
     )
+
+    st.divider()
 
     # Row 2: MWR (XIRR + all-time cumulative MWR)
     benchmark_all_time_mwr = next(
@@ -377,19 +532,20 @@ def render_performance() -> None:
             if result.mwr_xirr_annualized is not None
             else "—"
         ),
-        help="Money-weighted return: учитывает даты и объём всех денежных потоков.",
+        help="MWR в % годовых",
     )
     r2c2.metric(
-        "MWR бенчмарка (XIRR)",
+        "MWR (XIRR) Бенчмарк",
         (
             _fmt_pct(result.benchmark_mwr_xirr_annualized)
             if result.benchmark_mwr_xirr_annualized is not None
             else "—"
         ),
         help=(
-            f"Money-weighted доходность бенчмарка в годовых (XIRR) для ({result.benchmark_ticker})."
+            f"MWR в % годовых если бы инвестировали в бенчмарк ({result.benchmark_ticker})."
+            f"{benchmark_help_note}"
             if result.benchmark_ticker
-            else "Money-weighted доходность бенчмарка в годовых (XIRR)."
+            else f"MWR бенчмарка в % годовых если бы инвестировали в бенчмарк.{benchmark_help_note}"
         ),
     )
     r2c3.metric(
@@ -399,94 +555,42 @@ def render_performance() -> None:
             if result.points[-1].mwr_cum_return is not None
             else "—"
         ),
-        help="Money-weighted доходность за весь период наблюдений (не годовая).",
+        help=f"Прибыль на каждый вложенный {display_ccy}.",
     )
     r2c4.metric(
-        "MWR бенчмарка (все время)",
+        "MWR Бенчмарк (все время)",
         _fmt_pct(benchmark_all_time_mwr) if benchmark_all_time_mwr is not None else "—",
         help=(
-            f"Money-weighted доходность бенчмарка за весь период ({result.benchmark_ticker})."
+            f"Прибыль на каждый вложенный {display_ccy} если бы инвестировали в бенчмарк ({result.benchmark_ticker})."
+            f"{benchmark_help_note}"
             if result.benchmark_ticker
-            else "Money-weighted доходность бенчмарка за весь период."
+            else f"Прибыль на каждый вложенный {display_ccy} если бы инвестировали в бенчмарк.{benchmark_help_note}"
         ),
     )
 
+    st.divider()
+
     # Row 3: Portfolio simple return by period
-    period = compute_period_returns(result.points)
+    period = compute_period_returns(result.points, net_invested=result.net_invested)
     r3c1, r3c2, r3c3, r3c4, r3c5, r3c6 = st.columns(6)
-    r3c1.metric("Return - 1M", _fmt_pct(period["1M"]))
-    r3c2.metric("Return - 3M", _fmt_pct(period["3M"]))
-    r3c3.metric("Return - 6M", _fmt_pct(period["6M"]))
-    r3c4.metric("Return - 1Y", _fmt_pct(period["1Y"]))
-    r3c5.metric("Return - YTD", _fmt_pct(period["YTD"]))
-    r3c6.metric("Return - ALL", _fmt_pct(period["ALL"]))
+    r3c1.metric("P&L - 1M", _fmt_pct(period["1M"]))
+    r3c2.metric("P&L - 3M", _fmt_pct(period["3M"]))
+    r3c3.metric("P&L - 6M", _fmt_pct(period["6M"]))
+    r3c4.metric("P&L - 1Y", _fmt_pct(period["1Y"]))
+    r3c5.metric("P&L - YTD", _fmt_pct(period["YTD"]))
+    r3c6.metric("P&L - ALL", _fmt_pct(period["ALL"]))
 
     # Row 4: Benchmark simple return by period
-    benchmark_period = compute_benchmark_period_returns(result.points)
-    r4c1, r4c2, r4c3, r4c4, r4c5, r4c6 = st.columns(6)
-    r4c1.metric("Return Bench - 1M", _fmt_pct(benchmark_period["1M"]))
-    r4c2.metric("Return Bench - 3M", _fmt_pct(benchmark_period["3M"]))
-    r4c3.metric("Return Bench - 6M", _fmt_pct(benchmark_period["6M"]))
-    r4c4.metric("Return Bench - 1Y", _fmt_pct(benchmark_period["1Y"]))
-    r4c5.metric("Return Bench - YTD", _fmt_pct(benchmark_period["YTD"]))
-    r4c6.metric("Return Bench - ALL", _fmt_pct(benchmark_period["ALL"]))
-
-    df = pd.DataFrame(
-        {
-            "date": [p.date for p in result.points],
-            "portfolio_value": [p.portfolio_value for p in result.points],
-            "twr_cum_return": [p.twr_cum_return for p in result.points],
-            "mwr_cum_return": [p.mwr_cum_return for p in result.points],
-            "priced_ratio": [p.priced_ratio for p in result.points],
-            "benchmark_value": [p.benchmark_value for p in result.points],
-            "benchmark_cum_return": [p.benchmark_cum_return for p in result.points],
-            "benchmark_mwr_cum_return": [
-                p.benchmark_mwr_cum_return for p in result.points
-            ],
-        }
+    benchmark_period = compute_benchmark_period_returns(
+        result.points, net_invested=result.net_invested
     )
-    df["date"] = pd.to_datetime(df["date"])
-    chart_df = _filter_chart_df_by_frequency(df, chart_frequency)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        _render_plotly_line_chart(
-            chart_df,
-            y_col="portfolio_value",
-            title="Кривая стоимости",
-            is_percent=False,
-            hover_label=f"Value ({display_ccy})",
-            y_tick_prefix=f"{display_ccy} ",
-            benchmark_y_col="benchmark_value",
-            benchmark_label=f"Benchmark ({result.benchmark_ticker})",
-        )
-    with c2:
-        _render_plotly_line_chart(
-            chart_df,
-            y_col="twr_cum_return",
-            title="Кумулятивная доходность",
-            is_percent=True,
-            hover_label="Return",
-            benchmark_y_col="benchmark_cum_return",
-            benchmark_label=f"Benchmark ({result.benchmark_ticker})",
-        )
-    with c3:
-        _render_plotly_line_chart(
-            chart_df,
-            y_col="mwr_cum_return",
-            title="Кумулятивная MWR",
-            is_percent=True,
-            hover_label="MWR",
-            benchmark_y_col="benchmark_mwr_cum_return",
-            benchmark_label=f"Benchmark ({result.benchmark_ticker})",
-        )
-    if (
-        str(result.benchmark_ticker or "").upper() == "LQDT"
-        and str(display_ccy or "").upper() == "RUB"
-    ):
-        st.caption(
-            "Для benchmark `LQDT` на период до `2022-07-22` используется синтетическая "
-            "оценка по ключевой ставке ЦБ РФ."
-        )
+    r4c1, r4c2, r4c3, r4c4, r4c5, r4c6 = st.columns(6)
+    r4c1.metric("P&L Бенчмарк - 1M", _fmt_pct(benchmark_period["1M"]))
+    r4c2.metric("P&L Бенчмарк - 3M", _fmt_pct(benchmark_period["3M"]))
+    r4c3.metric("P&L Бенчмарк - 6M", _fmt_pct(benchmark_period["6M"]))
+    r4c4.metric("P&L Бенчмарк - 1Y", _fmt_pct(benchmark_period["1Y"]))
+    r4c5.metric("P&L Бенчмарк - YTD", _fmt_pct(benchmark_period["YTD"]))
+    r4c6.metric("P&L Бенчмарк - ALL", _fmt_pct(benchmark_period["ALL"]))
 
     low_coverage_days = int((df["priced_ratio"] < 1.0).sum())
     recent_low_coverage = int((df.tail(7)["priced_ratio"] < 1.0).sum())
