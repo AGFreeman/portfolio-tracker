@@ -1,5 +1,7 @@
 """Portfolio performance UI (TWR + historical backfill)."""
+import bisect
 import colorsys
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -10,6 +12,7 @@ from plotly.subplots import make_subplots
 from pathlib import Path
 
 from app.db import (
+    get_app_setting,
     get_instrument_provider,
     get_instrument_subclass_id_map,
     list_asset_classes,
@@ -27,6 +30,10 @@ from app.services.performance import (
     compute_benchmark_period_returns,
     compute_period_returns,
     compute_portfolio_performance,
+)
+from app.services.price_currency import (
+    bucket_diversification_currency,
+    resolve_quote_currency,
 )
 from app.services.policy_rates import (
     synthetic_policy_label,
@@ -460,6 +467,24 @@ def _ticker_group_label_cache(
     }
 
 
+@st.cache_data(show_spinner=False)
+def _ticker_currency_bucket_cache(
+    tickers_key: tuple[str, ...],
+    db_mtime: float,
+    quotes_cache_ts: int,
+) -> dict[str, str]:
+    _ = (db_mtime, quotes_cache_ts)
+    quotes = get_app_quotes(list(tickers_key)) if tickers_key else {}
+    out: dict[str, str] = {}
+    for ticker in tickers_key:
+        q = quotes.get(ticker) or quotes.get(ticker.upper())
+        live_ccy = q.currency if q is not None else None
+        out[ticker] = bucket_diversification_currency(
+            resolve_quote_currency(ticker, live_ccy)
+        )
+    return out
+
+
 def _subclass_sort_key(
     subclass_name: str,
     *,
@@ -598,6 +623,22 @@ def _ordered_breakdown_series_specs(
             prev_group = group
         return specs
 
+    if group_mode == "currencies":
+        currency_order = {"RUB": 0, "USD": 1, "EUR": 2}
+        currency_names = sorted(
+            seen,
+            key=lambda name: (currency_order.get(name, 99), name),
+        )
+        for currency_name in currency_names:
+            specs.append(
+                BreakdownSeriesSpec(
+                    name=currency_name,
+                    legend_group=currency_name,
+                    legend_group_title=None,
+                )
+            )
+        return specs
+
     class_name_to_sort = {c.name: int(c.sort_order) for c in class_by_id.values()}
     class_names = sorted(
         seen,
@@ -632,6 +673,7 @@ def _build_breakdown_chart_df(
     group_mode: str,
     *,
     db_mtime: float = 0.0,
+    quotes_cache_ts: int = 0,
 ) -> tuple[pd.DataFrame, list[BreakdownSeriesSpec]]:
     subclass_by_id, class_by_id = _asset_taxonomy_maps()
     label_cache: dict[str, str] = {}
@@ -647,6 +689,11 @@ def _build_breakdown_chart_df(
     elif group_mode in ("subclasses", "classes"):
         tickers_key = tuple(sorted(_collect_breakdown_tickers(points)))
         label_cache = _ticker_group_label_cache(tickers_key, group_mode, db_mtime)
+    elif group_mode == "currencies":
+        tickers_key = tuple(sorted(_collect_breakdown_tickers(points)))
+        label_cache = _ticker_currency_bucket_cache(
+            tickers_key, db_mtime, quotes_cache_ts
+        )
     seen_series: set[str] = set()
     rows: list[dict] = []
 
@@ -789,6 +836,132 @@ def _add_stacked_breakdown_trace(
     )
 
 
+_HISTORICAL_FX_SETTING_KEY = "historical_fx_v1"
+
+
+def _build_fx_to_rub_df(
+    chart_dates: pd.Series,
+    *,
+    rub_per_usd_spot: float,
+    eur_per_usd_spot: float,
+) -> pd.DataFrame:
+    """Align USD/RUB and EUR/RUB to chart dates (last FX on or before each day)."""
+    if chart_dates.empty:
+        return pd.DataFrame(columns=["date", "usd_rub", "eur_rub"])
+
+    fx_exact: dict[str, tuple[float, float]] = {}
+    raw = get_app_setting(_HISTORICAL_FX_SETTING_KEY)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            for day, pair in data.items():
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                rub, eur = float(pair[0]), float(pair[1])
+                if rub > 0 and eur > 0:
+                    fx_exact[str(day)] = (rub, eur)
+
+    default = (float(rub_per_usd_spot), float(eur_per_usd_spot))
+    sorted_fx_days = sorted(fx_exact.keys())
+
+    def _fx_pair_as_of(day: str) -> tuple[float, float]:
+        if not sorted_fx_days:
+            return default
+        idx = bisect.bisect_right(sorted_fx_days, day) - 1
+        if idx < 0:
+            return default
+        return fx_exact[sorted_fx_days[idx]]
+
+    rows: list[dict[str, object]] = []
+    for ts in chart_dates:
+        day = pd.Timestamp(ts).strftime("%Y-%m-%d")
+        rub, eur = _fx_pair_as_of(day)
+        eur_rub = rub / eur if eur > 0 else float("nan")
+        rows.append(
+            {
+                "date": pd.Timestamp(ts),
+                "usd_rub": float(rub),
+                "eur_rub": float(eur_rub),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _fx_secondary_axis_range(
+    fx_df: pd.DataFrame,
+    *,
+    currencies: set[str],
+) -> list[float] | None:
+    values: list[float] = []
+    if "USD" in currencies and "usd_rub" in fx_df.columns:
+        values.extend(
+            float(v) for v in fx_df["usd_rub"].tolist() if v is not None and pd.notna(v)
+        )
+    if "EUR" in currencies and "eur_rub" in fx_df.columns:
+        values.extend(
+            float(v) for v in fx_df["eur_rub"].tolist() if v is not None and pd.notna(v)
+        )
+    if not values:
+        return None
+    lo = min(values)
+    hi = max(values)
+    if lo == hi:
+        pad = max(1.0, abs(lo) * 0.02)
+        return [lo - pad, hi + pad]
+    span = hi - lo
+    pad = max(0.5, span * 0.05)
+    return [lo - pad, hi + pad]
+
+
+_FX_USD_LINE_COLOR = "#06B6D4"
+_FX_EUR_LINE_COLOR = "#C026D3"
+
+
+def _add_fx_to_rub_secondary_axis(
+    fig: go.Figure,
+    fx_df: pd.DataFrame,
+    *,
+    currencies: set[str],
+) -> bool:
+    if fx_df.empty or not currencies:
+        return False
+    added = False
+    if "USD" in currencies:
+        fig.add_trace(
+            go.Scatter(
+                x=fx_df["date"],
+                y=fx_df["usd_rub"],
+                mode="lines",
+                name="USD/RUB",
+                yaxis="y2",
+                line={"width": 2.5, "dash": "dash", "color": _FX_USD_LINE_COLOR},
+                hovertemplate="USD/RUB: %{y:,.2f} ₽<extra></extra>",
+                legendgroup="fx_rates",
+                legendgrouptitle_text="Курс к ₽" if not added else None,
+            )
+        )
+        added = True
+    if "EUR" in currencies:
+        fig.add_trace(
+            go.Scatter(
+                x=fx_df["date"],
+                y=fx_df["eur_rub"],
+                mode="lines",
+                name="EUR/RUB",
+                yaxis="y2",
+                line={"width": 2.5, "dash": "dot", "color": _FX_EUR_LINE_COLOR},
+                hovertemplate="EUR/RUB: %{y:,.2f} ₽<extra></extra>",
+                legendgroup="fx_rates",
+                legendgrouptitle_text="Курс к ₽" if not added else None,
+            )
+        )
+        added = True
+    return added
+
+
 def _render_value_breakdown_chart(
     df: pd.DataFrame,
     series_specs: list[BreakdownSeriesSpec],
@@ -797,6 +970,9 @@ def _render_value_breakdown_chart(
     height: int = 420,
     percent_mode: bool = False,
     cash_flow_markers: list[tuple[pd.Timestamp, str]] | None = None,
+    rub_per_usd: float = 95.0,
+    eur_per_usd: float = 0.92,
+    fx_currencies: set[str] | None = None,
 ) -> None:
     if df.empty or df["portfolio_value"].notna().sum() == 0:
         st.info("Недостаточно данных для графика.")
@@ -831,20 +1007,56 @@ def _render_value_breakdown_chart(
         st.info("Недостаточно данных для графика.")
         return
 
+    fx_selection = {str(c).upper() for c in (fx_currencies or set())}
+    show_fx_secondary = not percent_mode and bool(fx_selection)
+    has_fx_secondary = False
+    fx_df = pd.DataFrame()
+    if show_fx_secondary:
+        fx_df = _build_fx_to_rub_df(
+            df["date"],
+            rub_per_usd_spot=rub_per_usd,
+            eur_per_usd_spot=eur_per_usd,
+        )
+        has_fx_secondary = _add_fx_to_rub_secondary_axis(
+            fig,
+            fx_df,
+            currencies=fx_selection,
+        )
+
     if percent_mode:
-        fig.update_yaxes(
-            title=None,
-            tickformat=".0%",
-            ticksuffix="",
-            fixedrange=True,
+        fig.update_layout(
+            yaxis={
+                "title": None,
+                "tickformat": ".0%",
+                "ticksuffix": "",
+                "fixedrange": True,
+            }
         )
     else:
-        fig.update_yaxes(
-            title=None,
-            tickprefix=f"{display_ccy} ",
-            tickformat=",.0f",
-            fixedrange=True,
+        fig.update_layout(
+            yaxis={
+                "title": None,
+                "tickprefix": f"{display_ccy} ",
+                "tickformat": ",.0f",
+                "fixedrange": True,
+            }
         )
+    if has_fx_secondary:
+        yaxis2: dict[str, object] = {
+            "title": None,
+            "overlaying": "y",
+            "side": "right",
+            "tickformat": ",.1f",
+            "ticksuffix": " ₽",
+            "showgrid": False,
+            "fixedrange": True,
+            "automargin": True,
+            "ticklabelposition": "outside",
+        }
+        fx_range = _fx_secondary_axis_range(fx_df, currencies=fx_selection)
+        if fx_range is not None:
+            yaxis2["range"] = fx_range
+        fig.update_layout(yaxis2=yaxis2)
     fig.update_xaxes(
         title=None,
         tickformat="%m-%Y",
@@ -856,7 +1068,13 @@ def _render_value_breakdown_chart(
         _cash_flow_markers_in_df_range(cash_flow_markers or [], df),
         subplot_cols=1,
     )
-    legend_right_margin = 180 if height >= 600 else 140
+    base_legend_margin = 180 if height >= 600 else 140
+    if has_fx_secondary:
+        legend_right_margin = base_legend_margin + 88
+        legend_x = 1.14
+    else:
+        legend_right_margin = base_legend_margin
+        legend_x = 1.02
     fig.update_layout(
         margin={"l": 8, "r": legend_right_margin, "t": 24, "b": 24},
         height=height,
@@ -868,7 +1086,7 @@ def _render_value_breakdown_chart(
             "yanchor": "top",
             "y": 1,
             "xanchor": "left",
-            "x": 1.02,
+            "x": legend_x,
             "tracegroupgap": 8,
             "itemsizing": "constant",
             "groupclick": "toggleitem",
@@ -1064,28 +1282,92 @@ def render_performance() -> None:
             return
 
     with st.container(horizontal=True, gap="small"):
+        view_label = st.segmented_control(
+            "Вид",
+            options=["Overview", "Breakdown"],
+            format_func=lambda x: "Общая" if x == "Overview" else "Разбивка",
+            default="Overview",
+            key="perf_view_mode",
+            width="content",
+        )
         freq_label = st.segmented_control(
-            "Частота графиков",
+            "Частота",
             options=["Months", "Weeks", "Days"],
             format_func=lambda x: (
                 "Месяцы" if x == "Months" else "Недели" if x == "Weeks" else "Дни"
             ),
             default="Months",
             key="perf_chart_frequency",
+            width="content",
         )
-        show_cash_flow_lines = st.toggle(
-            "Вводы/Выводы",
-            value=False,
-            key="perf_show_cash_flow_lines",
-            help=(
-                "Вертикальные линии на графиках по датам из раздела «Ввод и вывод». "
-                "Зелёная — ввод, красная — вывод."
-            ),
+        cash_flow_label = st.segmented_control(
+            "Ввод/Вывод",
+            options=["Off", "On"],
+            format_func=lambda x: "Выкл." if x == "Off" else "Вкл.",
+            default="Off",
+            key="perf_cash_flow_lines",
+            width="content",
         )
+
+        is_breakdown = view_label == "Breakdown"
+        if is_breakdown:
+            group_label = st.segmented_control(
+                "Группировка",
+                options=["Tickers", "Subclasses", "Classes", "Currencies"],
+                format_func=lambda x: (
+                    "Тикеры"
+                    if x == "Tickers"
+                    else (
+                        "Подклассы"
+                        if x == "Subclasses"
+                        else "Классы" if x == "Classes" else "Валюты"
+                    )
+                ),
+                default="Tickers",
+                key="perf_breakdown_group_mode",
+                width="content",
+            )
+            value_label = st.segmented_control(
+                "Отображение",
+                options=["Absolute", "Percent"],
+                format_func=lambda x: "Абс." if x == "Absolute" else "%",
+                default="Percent",
+                key="perf_breakdown_value_mode",
+                width="content",
+            )
+            percent_mode = value_label == "Percent"
+            if not percent_mode:
+                fx_raw = st.segmented_control(
+                    "Курс к ₽",
+                    options=["USD", "EUR"],
+                    selection_mode="multi",
+                    default=["USD"],
+                    key="perf_breakdown_fx_currencies",
+                    width="content",
+                )
+                fx_currencies = {str(c).upper() for c in (fx_raw or [])}
+            else:
+                fx_currencies = set()
+        else:
+            group_label = st.session_state.get("perf_breakdown_group_mode", "Tickers")
+            value_label = st.session_state.get("perf_breakdown_value_mode", "Percent")
+            percent_mode = value_label == "Percent"
+            fx_raw = st.session_state.get("perf_breakdown_fx_currencies", ["USD"])
+            fx_currencies = {str(c).upper() for c in (fx_raw or [])}
     chart_frequency = (
         "monthly"
         if freq_label == "Months"
         else ("weekly" if freq_label == "Weeks" else "daily")
+    )
+    show_cash_flow_lines = cash_flow_label == "On"
+    group_mode = (
+        "tickers"
+        if group_label == "Tickers"
+        else (
+            "subclasses"
+            if group_label == "Subclasses"
+            else "classes" if group_label == "Classes" else "currencies"
+        )
     )
     db_path = Path(__file__).resolve().parents[2] / "data" / "portfolio.db"
     db_mtime = float(db_path.stat().st_mtime) if db_path.exists() else 0.0
@@ -1122,9 +1404,8 @@ def render_performance() -> None:
         _cash_flow_chart_markers(db_mtime) if show_cash_flow_lines else []
     )
     benchmark_help_note = _synthetic_benchmark_help_note(result, display_ccy)
-    tab_overview, tab_breakdown = st.tabs(["Общая", "Разбивка"])
 
-    with tab_overview:
+    if view_label == "Overview":
         _render_performance_charts(
             chart_df,
             display_ccy=display_ccy,
@@ -1276,36 +1557,12 @@ def render_performance() -> None:
                 )
             st.warning(" | ".join(warn))
 
-    with tab_breakdown:
-        with st.container(horizontal=True, gap="small"):
-            group_label = st.segmented_control(
-                "Группировка",
-                options=["Tickers", "Subclasses", "Classes"],
-                format_func=lambda x: (
-                    "Тикеры"
-                    if x == "Tickers"
-                    else "Подклассы" if x == "Subclasses" else "Классы"
-                ),
-                default="Tickers",
-                key="perf_breakdown_group_mode",
-            )
-            value_label = st.segmented_control(
-                "Отображение",
-                options=["Absolute", "Percent"],
-                format_func=lambda x: "Абс." if x == "Absolute" else "%",
-                default="Percent",
-                key="perf_breakdown_value_mode",
-            )
-        group_mode = (
-            "tickers"
-            if group_label == "Tickers"
-            else "subclasses" if group_label == "Subclasses" else "classes"
-        )
-        percent_mode = value_label == "Percent"
+    else:
         breakdown_df, series_specs = _build_breakdown_chart_df(
             result.points,
             group_mode,
             db_mtime=db_mtime,
+            quotes_cache_ts=_quotes_cache_ts(),
         )
         breakdown_chart_df = _filter_chart_df_by_frequency(
             breakdown_df, chart_frequency
@@ -1322,4 +1579,7 @@ def render_performance() -> None:
             height=840,
             percent_mode=percent_mode,
             cash_flow_markers=cash_flow_markers,
+            rub_per_usd=rub,
+            eur_per_usd=eur,
+            fx_currencies=fx_currencies,
         )
