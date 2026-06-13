@@ -1361,6 +1361,52 @@ def set_instrument_provider(ticker: str, provider: str, provider_symbol: Optiona
         conn.close()
 
 
+def get_instrument_subclass_id_map(tickers: Sequence[str]) -> Dict[str, int]:
+    """
+    Подкласс для набора тикеров: один запрос к instruments + эвристика в памяти.
+    """
+    from app.services.subclass_inference import DEFAULT_SUBCLASS_NAME, infer_subclass_name
+
+    uniq = sorted({(t or "").strip().upper() for t in tickers if (t or "").strip()})
+    if not uniq:
+        return {}
+
+    subclass_name_to_id = {s.name: s.id for s in list_asset_subclasses()}
+    default_sid = subclass_name_to_id.get(DEFAULT_SUBCLASS_NAME)
+    if default_sid is None:
+        default_sid = get_first_subclass_id()
+
+    conn = get_conn()
+    try:
+        q_marks = ",".join(["?"] * len(uniq))
+        rows = conn.execute(
+            f"SELECT ticker, asset_subclass_id FROM instruments WHERE ticker IN ({q_marks})",
+            tuple(uniq),
+        ).fetchall()
+        configured = {
+            str(r["ticker"]).upper(): int(r["asset_subclass_id"])
+            for r in rows
+            if r["asset_subclass_id"] is not None
+        }
+    finally:
+        conn.close()
+
+    out: Dict[str, int] = {}
+    for ticker in uniq:
+        sid = configured.get(ticker)
+        if sid is not None:
+            out[ticker] = sid
+            continue
+        guessed_name = infer_subclass_name(ticker)
+        if guessed_name:
+            sid = subclass_name_to_id.get(guessed_name)
+            if sid is not None:
+                out[ticker] = sid
+                continue
+        out[ticker] = default_sid
+    return out
+
+
 def get_instrument_asset_subclass(ticker: str) -> Optional[int]:
     """Подкласс из настроек тикера (instruments), если задан."""
     conn = get_conn()

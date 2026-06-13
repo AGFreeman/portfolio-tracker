@@ -10,6 +10,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 from app.db import (
     get_app_setting,
+    get_instrument_main_map,
     list_cash_flows,
     list_transactions,
     list_cached_historical_quotes,
@@ -39,6 +40,9 @@ class PerformancePoint:
     benchmark_value: Optional[float] = None
     benchmark_cum_return: Optional[float] = None
     benchmark_mwr_cum_return: Optional[float] = None
+    main_ticker_values: Optional[Dict[str, float]] = None
+    other_assets_value: Optional[float] = None
+    ticker_values: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -223,6 +227,52 @@ def _quote_as_of(
     return q
 
 
+def _holdings_values_by_ticker_as_of_day(
+    holdings: Mapping[str, float],
+    as_of_index_by_ticker: Mapping[str, Tuple[List[str], List[PriceQuote]]],
+    day: str,
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Tuple[float, int, int, Dict[str, float]]:
+    """Value each holding using the latest available quote on or before `day`."""
+    total_value = 0.0
+    total_pos = 0
+    priced_pos = 0
+    ticker_values: Dict[str, float] = {}
+    for ticker, amount in holdings.items():
+        if float(amount) <= 0:
+            continue
+        dates, quotes = as_of_index_by_ticker.get(ticker, ([], []))
+        q = _quote_as_of(dates, quotes, day)
+        if is_excluded_from_coverage_metric(ticker):
+            if q is not None:
+                value = convert_amount(
+                    amount=float(amount) * float(q.price),
+                    from_ccy=q.currency,
+                    to_ccy=display_currency,
+                    rub_per_usd=rub_per_usd,
+                    eur_per_usd=eur_per_usd,
+                )
+                total_value += value
+                ticker_values[str(ticker).upper()] = float(value)
+            continue
+        total_pos += 1
+        if q is None:
+            continue
+        value = convert_amount(
+            amount=float(amount) * float(q.price),
+            from_ccy=q.currency,
+            to_ccy=display_currency,
+            rub_per_usd=rub_per_usd,
+            eur_per_usd=eur_per_usd,
+        )
+        total_value += value
+        ticker_values[str(ticker).upper()] = float(value)
+        priced_pos += 1
+    return float(total_value), priced_pos, total_pos, ticker_values
+
+
 def _holdings_value_as_of_day(
     holdings: Mapping[str, float],
     as_of_index_by_ticker: Mapping[str, Tuple[List[str], List[PriceQuote]]],
@@ -232,36 +282,36 @@ def _holdings_value_as_of_day(
     eur_per_usd: float,
 ) -> Tuple[float, int, int]:
     """Sum holdings using the latest available quote on or before `day` per ticker."""
-    total_value = 0.0
-    total_pos = 0
-    priced_pos = 0
-    for ticker, amount in holdings.items():
-        if float(amount) <= 0:
-            continue
-        dates, quotes = as_of_index_by_ticker.get(ticker, ([], []))
-        q = _quote_as_of(dates, quotes, day)
-        if is_excluded_from_coverage_metric(ticker):
-            if q is not None:
-                total_value += convert_amount(
-                    amount=float(amount) * float(q.price),
-                    from_ccy=q.currency,
-                    to_ccy=display_currency,
-                    rub_per_usd=rub_per_usd,
-                    eur_per_usd=eur_per_usd,
-                )
-            continue
-        total_pos += 1
-        if q is None:
-            continue
-        total_value += convert_amount(
-            amount=float(amount) * float(q.price),
-            from_ccy=q.currency,
-            to_ccy=display_currency,
-            rub_per_usd=rub_per_usd,
-            eur_per_usd=eur_per_usd,
-        )
-        priced_pos += 1
+    total_value, priced_pos, total_pos, _ticker_values = _holdings_values_by_ticker_as_of_day(
+        holdings,
+        as_of_index_by_ticker,
+        day,
+        display_currency,
+        rub_per_usd,
+        eur_per_usd,
+    )
     return float(total_value), priced_pos, total_pos
+
+
+def split_ticker_values_by_main(
+    ticker_values: Mapping[str, float],
+    main_map: Mapping[str, bool],
+) -> Tuple[Dict[str, float], float]:
+    """Split per-ticker values into main-portfolio tickers and other assets sum."""
+    main_ticker_values: Dict[str, float] = {}
+    other_assets_value = 0.0
+    for ticker, value in ticker_values.items():
+        up = str(ticker or "").upper().strip()
+        if not up:
+            continue
+        amount = float(value)
+        if amount <= 0:
+            continue
+        if bool(main_map.get(up, False)):
+            main_ticker_values[up] = amount
+        else:
+            other_assets_value += amount
+    return main_ticker_values, float(other_assets_value)
 
 
 def _build_active_intervals_by_ticker(
@@ -295,28 +345,24 @@ def _build_active_intervals_by_ticker(
     return intervals
 
 
-def compute_current_portfolio_market_value(
+def _current_positions_value_by_ticker(
     display_currency: str,
     rub_per_usd: float,
     eur_per_usd: float,
-) -> Tuple[float, int, int]:
+) -> Tuple[Dict[str, float], int, int]:
     """
-    Current portfolio value using the same rules as the portfolio summary header:
+    Current per-ticker values using the same rules as the portfolio summary header:
     session quote cache via get_app_quotes + display FX from the UI.
     """
     from app.db import list_positions_by_ticker
-    from app.db import list_cached_historical_quotes
     from app.services.prices import get_app_quotes
 
     positions = list_positions_by_ticker()
     tickers = list({p.ticker for p in positions if float(p.amount or 0) > 0})
     if not tickers:
-        return 0.0, 0, 0
+        return {}, 0, 0
 
     quotes = get_app_quotes(tickers)
-    # Fallback for missing live quotes: use the most recent cached historical quote.
-    # This keeps the header/performance last point stable even when a provider
-    # temporarily fails (e.g. Yahoo returning None).
     today = date.today().isoformat()
     hist_fallback: Dict[str, PriceQuote] = {}
     for t in tickers:
@@ -326,7 +372,6 @@ def compute_current_portfolio_market_value(
         q = quotes.get(t) or quotes.get(up)
         if q is not None and q.price is not None:
             continue
-        # Try up to 1Y lookback to find the latest cached quote.
         start = (date.today() - timedelta(days=365)).isoformat()
         last_q: Optional[PriceQuote] = None
         last_day: Optional[str] = None
@@ -336,7 +381,8 @@ def compute_current_portfolio_market_value(
                 last_q = PriceQuote(price=float(p), currency=str(ccy))
         if last_q is not None and last_q.price is not None:
             hist_fallback[up] = last_q
-    total_value = 0.0
+
+    ticker_values: Dict[str, float] = {}
     total_pos = 0
     priced_pos = 0
     for p in positions:
@@ -352,7 +398,7 @@ def compute_current_portfolio_market_value(
         price = normalize_quote_price_for_valuation(p.ticker, raw_price, quote_ccy)
         if is_excluded_from_coverage_metric(ticker):
             if price is not None:
-                total_value += convert_amount(
+                ticker_values[ticker] = convert_amount(
                     amount=amount * float(price),
                     from_ccy=quote_ccy,
                     to_ccy=display_currency,
@@ -363,7 +409,7 @@ def compute_current_portfolio_market_value(
         total_pos += 1
         if price is None:
             continue
-        total_value += convert_amount(
+        ticker_values[ticker] = convert_amount(
             amount=amount * float(price),
             from_ccy=quote_ccy,
             to_ccy=display_currency,
@@ -371,7 +417,20 @@ def compute_current_portfolio_market_value(
             eur_per_usd=eur_per_usd,
         )
         priced_pos += 1
-    return float(total_value), priced_pos, total_pos
+    return ticker_values, priced_pos, total_pos
+
+
+def compute_current_portfolio_market_value(
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Tuple[float, int, int]:
+    ticker_values, priced_pos, total_pos = _current_positions_value_by_ticker(
+        display_currency,
+        rub_per_usd,
+        eur_per_usd,
+    )
+    return float(sum(ticker_values.values())), priced_pos, total_pos
 
 
 def _normalize_price_series(
@@ -416,6 +475,7 @@ def compute_portfolio_performance(
     days = _iter_dates(start, end)
     fx_exact = _load_fx_exact_from_db(start, end)
     all_tickers = sorted({t for day_rows in tx_by_day.values() for t, _amount, _tx_type in day_rows})
+    main_map = get_instrument_main_map(all_tickers)
     active_intervals_by_ticker = _build_active_intervals_by_ticker(tx_by_day, days) if days else {}
 
     benchmark_cfg = _get_money_market_benchmark_for_currency(display_currency)
@@ -506,13 +566,16 @@ def compute_portfolio_performance(
         priced_pos = 0
         exact_value = 0.0
 
-        exact_value, priced_pos, total_pos = _holdings_value_as_of_day(
+        exact_value, priced_pos, total_pos, ticker_values = _holdings_values_by_ticker_as_of_day(
             holdings,
             as_of_index_by_ticker,
             d,
             display_currency,
             day_rub_per_usd,
             day_eur_per_usd,
+        )
+        main_ticker_values, other_assets_value = split_ticker_values_by_main(
+            ticker_values, main_map
         )
 
         total_value = float(exact_value)
@@ -662,20 +725,30 @@ def compute_portfolio_performance(
                     if (benchmark_ticker and benchmark_mwr_cum_return is not None)
                     else None
                 ),
+                main_ticker_values=main_ticker_values,
+                other_assets_value=other_assets_value,
+                ticker_values=dict(ticker_values),
             )
         )
 
     # Align the last point with the portfolio summary header (session quote cache + UI FX).
     if points:
         try:
-            header_value, header_priced_pos, header_total_pos = compute_current_portfolio_market_value(
+            ticker_values, header_priced_pos, header_total_pos = _current_positions_value_by_ticker(
                 display_currency,
                 rub_per_usd,
                 eur_per_usd,
             )
             if header_priced_pos <= 0:
                 raise RuntimeError("header quotes unavailable")
-            points[-1].portfolio_value = float(header_value)
+            main_ticker_values, other_assets_value = split_ticker_values_by_main(
+                ticker_values, main_map
+            )
+            header_value = float(sum(ticker_values.values()))
+            points[-1].portfolio_value = header_value
+            points[-1].main_ticker_values = main_ticker_values
+            points[-1].other_assets_value = other_assets_value
+            points[-1].ticker_values = dict(ticker_values)
             points[-1].priced_ratio = (
                 float(header_priced_pos) / float(header_total_pos)
                 if header_total_pos > 0
@@ -683,16 +756,24 @@ def compute_portfolio_performance(
             )
             _apply_portfolio_twr_cum_returns(points)
         except Exception:
-            header_value, header_priced_pos, header_total_pos = _holdings_value_as_of_day(
-                holdings,
-                as_of_index_by_ticker,
-                end,
-                display_currency,
-                rub_per_usd,
-                eur_per_usd,
+            header_value, header_priced_pos, header_total_pos, ticker_values = (
+                _holdings_values_by_ticker_as_of_day(
+                    holdings,
+                    as_of_index_by_ticker,
+                    end,
+                    display_currency,
+                    rub_per_usd,
+                    eur_per_usd,
+                )
             )
             if header_priced_pos > 0:
+                main_ticker_values, other_assets_value = split_ticker_values_by_main(
+                    ticker_values, main_map
+                )
                 points[-1].portfolio_value = float(header_value)
+                points[-1].main_ticker_values = main_ticker_values
+                points[-1].other_assets_value = other_assets_value
+                points[-1].ticker_values = dict(ticker_values)
                 points[-1].priced_ratio = (
                     float(header_priced_pos) / float(header_total_pos)
                     if header_total_pos > 0

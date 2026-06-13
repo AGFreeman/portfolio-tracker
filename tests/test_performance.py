@@ -82,6 +82,48 @@ class TestHoldingsValueAsOf(unittest.TestCase):
         self.assertEqual(total_pos, 1)
 
 
+class TestHoldingsValuesByTicker(unittest.TestCase):
+    def test_per_ticker_values_sum_to_total(self):
+        from app.services.performance import (
+            _build_as_of_price_index,
+            _holdings_values_by_ticker_as_of_day,
+        )
+
+        idx = {
+            "SBER": _build_as_of_price_index(
+                {"2026-05-29": PriceQuote(price=100.0, currency="RUB")}
+            ),
+            "GAZP": _build_as_of_price_index(
+                {"2026-05-29": PriceQuote(price=200.0, currency="RUB")}
+            ),
+        }
+        total, priced_pos, total_pos, ticker_values = _holdings_values_by_ticker_as_of_day(
+            {"SBER": 10.0, "GAZP": 5.0},
+            idx,
+            "2026-05-31",
+            "RUB",
+            90.0,
+            0.9,
+        )
+        self.assertAlmostEqual(total, 2000.0)
+        self.assertAlmostEqual(sum(ticker_values.values()), total)
+        self.assertAlmostEqual(ticker_values["SBER"], 1000.0)
+        self.assertAlmostEqual(ticker_values["GAZP"], 1000.0)
+        self.assertEqual(priced_pos, 2)
+        self.assertEqual(total_pos, 2)
+
+
+class TestSplitTickerValuesByMain(unittest.TestCase):
+    def test_splits_main_and_other_assets(self):
+        from app.services.performance import split_ticker_values_by_main
+
+        ticker_values = {"SBER": 1000.0, "GAZP": 500.0, "BTC": 300.0}
+        main_map = {"SBER": True, "GAZP": True, "BTC": False}
+        main_vals, other_sum = split_ticker_values_by_main(ticker_values, main_map)
+        self.assertEqual(main_vals, {"SBER": 1000.0, "GAZP": 500.0})
+        self.assertAlmostEqual(other_sum, 300.0)
+
+
 class TestPeriodReturns(unittest.TestCase):
     def test_period_helpers_non_empty(self):
         points = [

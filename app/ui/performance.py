@@ -1,11 +1,22 @@
 """Portfolio performance UI (TWR + historical backfill)."""
+import colorsys
+from collections import defaultdict
+from dataclasses import dataclass
+
 import plotly.graph_objects as go
 import pandas as pd
 import streamlit as st
 from plotly.subplots import make_subplots
 from pathlib import Path
 
-from app.db import list_positions_by_ticker
+from app.db import (
+    get_instrument_provider,
+    get_instrument_subclass_id_map,
+    list_asset_classes,
+    list_asset_subclasses,
+    list_cash_flows,
+    list_positions_by_ticker,
+)
 from app.services.fx import format_money
 from app.services.prices import (
     get_app_quotes,
@@ -49,6 +60,8 @@ def _synthetic_benchmark_help_note(result, display_ccy: str) -> str:
 
 _PORTFOLIO_LINE = {"width": 2, "color": "#636EFA"}
 _BENCHMARK_LINE = {"width": 2, "dash": "dot", "color": "#EF553B"}
+_CASHFLOW_VLINE_IN = "rgba(46, 125, 50, 0.55)"
+_CASHFLOW_VLINE_OUT = "rgba(198, 40, 40, 0.55)"
 
 
 def _add_subplot_line_traces(
@@ -125,11 +138,91 @@ def _add_subplot_line_traces(
     return True
 
 
+def _cash_flow_vline_shape(
+    ts: pd.Timestamp,
+    kind: str,
+    *,
+    xref: str,
+    yref: str,
+) -> dict:
+    color = _CASHFLOW_VLINE_IN if kind == "in" else _CASHFLOW_VLINE_OUT
+    x = pd.to_datetime(ts).isoformat()
+    return {
+        "type": "line",
+        "x0": x,
+        "x1": x,
+        "y0": 0,
+        "y1": 1,
+        "xref": xref,
+        "yref": yref,
+        "line": {"color": color, "width": 1, "dash": "dot"},
+        "layer": "below",
+    }
+
+
+def _subplot_axis_refs(col: int) -> tuple[str, str]:
+    if col <= 1:
+        return "x", "y domain"
+    return f"x{col}", f"y{col} domain"
+
+
+@st.cache_data(show_spinner=False)
+def _cash_flow_chart_markers_cached(db_mtime: float) -> tuple[tuple[str, str], ...]:
+    _ = db_mtime
+    net_by_day: dict[str, float] = defaultdict(float)
+    for flow in list_cash_flows():
+        day = str(flow.flow_date or "")[:10]
+        if not day:
+            continue
+        net_by_day[day] += float(flow.amount)
+    markers: list[tuple[str, str]] = []
+    for day in sorted(net_by_day):
+        net = float(net_by_day[day])
+        if abs(net) <= 1e-12:
+            continue
+        markers.append((day, "in" if net > 0 else "out"))
+    return tuple(markers)
+
+
+def _cash_flow_chart_markers(db_mtime: float) -> list[tuple[pd.Timestamp, str]]:
+    return [
+        (pd.to_datetime(day), kind)
+        for day, kind in _cash_flow_chart_markers_cached(db_mtime)
+    ]
+
+
+def _cash_flow_markers_in_df_range(
+    markers: list[tuple[pd.Timestamp, str]],
+    df: pd.DataFrame,
+) -> list[tuple[pd.Timestamp, str]]:
+    if df.empty or "date" not in df.columns:
+        return []
+    dmin = pd.to_datetime(df["date"]).min()
+    dmax = pd.to_datetime(df["date"]).max()
+    return [(ts, kind) for ts, kind in markers if dmin <= ts <= dmax]
+
+
+def _cash_flow_vline_shapes(
+    markers: list[tuple[pd.Timestamp, str]],
+    *,
+    subplot_cols: int = 1,
+) -> list[dict]:
+    if not markers:
+        return []
+    shapes: list[dict] = []
+    for col_idx in range(1, subplot_cols + 1):
+        xref, yref = _subplot_axis_refs(col_idx)
+        for ts, kind in markers:
+            shapes.append(_cash_flow_vline_shape(ts, kind, xref=xref, yref=yref))
+    return shapes
+
+
 def _render_performance_charts(
     df: pd.DataFrame,
     *,
     display_ccy: str,
     benchmark_label: str,
+    cash_flow_markers: list[tuple[pd.Timestamp, str]] | None = None,
 ) -> None:
     panels = (
         {
@@ -206,17 +299,579 @@ def _render_performance_charts(
         st.info("Недостаточно данных для графика.")
         return
 
+    vline_markers = _cash_flow_markers_in_df_range(cash_flow_markers or [], df)
+    vline_shapes = _cash_flow_vline_shapes(vline_markers, subplot_cols=3)
+
     fig.update_layout(
         margin={"l": 8, "r": 8, "t": 48, "b": 72},
         height=300,
         hovermode="x unified",
         dragmode="zoom",
+        shapes=vline_shapes,
         legend={
             "orientation": "h",
             "yanchor": "top",
             "y": -0.18,
             "xanchor": "center",
             "x": 0.5,
+        },
+    )
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={
+            "displaylogo": False,
+            "scrollZoom": True,
+            "modeBarButtonsToRemove": [
+                "pan2d",
+                "select2d",
+                "lasso2d",
+                "toImage",
+            ],
+        },
+    )
+
+
+def _value_series_col(name: str) -> str:
+    return f"value::{name}"
+
+
+_NON_US_YF_SUFFIXES = {
+    ".AS",
+    ".AT",
+    ".AX",
+    ".BE",
+    ".BK",
+    ".BR",
+    ".CO",
+    ".DE",
+    ".DU",
+    ".F",
+    ".HE",
+    ".HK",
+    ".IR",
+    ".JK",
+    ".JO",
+    ".KQ",
+    ".KS",
+    ".L",
+    ".LS",
+    ".MC",
+    ".ME",
+    ".MI",
+    ".MX",
+    ".NS",
+    ".NZ",
+    ".OL",
+    ".PA",
+    ".PR",
+    ".SA",
+    ".SG",
+    ".SI",
+    ".SN",
+    ".SR",
+    ".SS",
+    ".ST",
+    ".SW",
+    ".SZ",
+    ".T",
+    ".TA",
+    ".TLV",
+    ".TO",
+    ".TSX",
+    ".TW",
+    ".VI",
+    ".WA",
+}
+
+
+def _is_us_exchange_ticker(ticker: str) -> bool:
+    """Same heuristic as portfolio summary table."""
+    up = (ticker or "").upper().strip()
+    if not up:
+        return False
+    row = get_instrument_provider(up)
+    provider = (row[0] if row else None) or ""
+    if provider in ("moex_iss", "tbank", "coingecko"):
+        return False
+    if up.endswith("-EUR") or up.endswith("-RUB"):
+        return False
+    return not any(up.endswith(sfx) for sfx in _NON_US_YF_SUFFIXES)
+
+
+@dataclass(frozen=True)
+class BreakdownSeriesSpec:
+    name: str
+    legend_group: str
+    legend_group_title: str | None = None
+
+
+def _asset_taxonomy_maps():
+    subclass_by_id = {s.id: s for s in list_asset_subclasses()}
+    class_by_id = {c.id: c for c in list_asset_classes()}
+    return subclass_by_id, class_by_id
+
+
+def _label_from_subclass_id(
+    subclass_id: int,
+    group_mode: str,
+    *,
+    subclass_by_id: dict,
+    class_by_id: dict,
+) -> str:
+    sub = subclass_by_id.get(subclass_id)
+    if group_mode == "subclasses":
+        return sub.name if sub else "—"
+    if group_mode == "classes":
+        if sub:
+            asset_class = class_by_id.get(sub.asset_class_id)
+            return asset_class.name if asset_class else "—"
+        return "—"
+    return "—"
+
+
+def _collect_breakdown_tickers(points) -> set[str]:
+    tickers: set[str] = set()
+    for p in points:
+        ticker_vals = dict(p.ticker_values or {})
+        if not ticker_vals:
+            ticker_vals = dict(p.main_ticker_values or {})
+        tickers.update(str(k).upper() for k in ticker_vals)
+    return tickers
+
+
+@st.cache_data(show_spinner=False)
+def _ticker_group_label_cache(
+    tickers_key: tuple[str, ...],
+    group_mode: str,
+    db_mtime: float,
+) -> dict[str, str]:
+    _ = db_mtime
+    subclass_by_id, class_by_id = _asset_taxonomy_maps()
+    subclass_ids = get_instrument_subclass_id_map(tickers_key)
+    return {
+        ticker: _label_from_subclass_id(
+            subclass_ids[ticker],
+            group_mode,
+            subclass_by_id=subclass_by_id,
+            class_by_id=class_by_id,
+        )
+        for ticker in tickers_key
+    }
+
+
+def _subclass_sort_key(
+    subclass_name: str,
+    *,
+    subclass_by_id: dict,
+    class_by_id: dict,
+    subclass_name_to_id: dict[str, int],
+) -> tuple:
+    sid = subclass_name_to_id.get(subclass_name)
+    sub = subclass_by_id.get(sid) if sid is not None else None
+    asset_class = class_by_id.get(sub.asset_class_id) if sub else None
+    return (
+        int(asset_class.sort_order) if asset_class else 10**9,
+        int(sub.sort_order) if sub else 10**9,
+        subclass_name,
+    )
+
+
+def _ticker_sort_key(
+    ticker: str,
+    *,
+    ticker_subclass_ids: dict[str, int],
+    subclass_by_id: dict,
+    class_by_id: dict,
+) -> tuple:
+    up = str(ticker).upper()
+    sid = ticker_subclass_ids.get(up)
+    sub = subclass_by_id.get(sid) if sid is not None else None
+    asset_class = class_by_id.get(sub.asset_class_id) if sub else None
+    return (
+        int(asset_class.sort_order) if asset_class else 10**9,
+        int(sub.sort_order) if sub else 10**9,
+        0 if _is_us_exchange_ticker(up) else 1,
+        up,
+    )
+
+
+def _subclass_name_for_ticker(
+    ticker: str,
+    *,
+    ticker_subclass_ids: dict[str, int],
+    subclass_by_id: dict,
+) -> str:
+    up = str(ticker).upper()
+    sid = ticker_subclass_ids.get(up)
+    sub = subclass_by_id.get(sid) if sid is not None else None
+    return sub.name if sub else "—"
+
+
+def _class_name_for_subclass(
+    subclass_name: str,
+    *,
+    subclass_by_id: dict,
+    class_by_id: dict,
+    subclass_name_to_id: dict[str, int],
+) -> str:
+    sid = subclass_name_to_id.get(subclass_name)
+    sub = subclass_by_id.get(sid) if sid is not None else None
+    if sub:
+        asset_class = class_by_id.get(sub.asset_class_id)
+        return asset_class.name if asset_class else "—"
+    return "—"
+
+
+def _ordered_breakdown_series_specs(
+    group_mode: str,
+    seen: set[str],
+    *,
+    subclass_by_id: dict,
+    class_by_id: dict,
+    ticker_subclass_ids: dict[str, int] | None = None,
+) -> list[BreakdownSeriesSpec]:
+    subclass_name_to_id = {s.name: s.id for s in subclass_by_id.values()}
+    specs: list[BreakdownSeriesSpec] = []
+
+    if group_mode == "tickers":
+        ticker_subclass_ids = ticker_subclass_ids or {}
+        tickers = sorted(
+            (t for t in seen if t != "Прочие активы"),
+            key=lambda t: _ticker_sort_key(
+                t,
+                ticker_subclass_ids=ticker_subclass_ids,
+                subclass_by_id=subclass_by_id,
+                class_by_id=class_by_id,
+            ),
+        )
+        prev_group: str | None = None
+        for ticker in tickers:
+            group = _subclass_name_for_ticker(
+                ticker,
+                ticker_subclass_ids=ticker_subclass_ids,
+                subclass_by_id=subclass_by_id,
+            )
+            specs.append(
+                BreakdownSeriesSpec(
+                    name=ticker,
+                    legend_group=group,
+                    legend_group_title=group if group != prev_group else None,
+                )
+            )
+            prev_group = group
+        if "Прочие активы" in seen:
+            specs.append(
+                BreakdownSeriesSpec(
+                    name="Прочие активы",
+                    legend_group="Прочие активы",
+                    legend_group_title="Прочие активы",
+                )
+            )
+        return specs
+
+    if group_mode == "subclasses":
+        subclass_names = sorted(
+            seen,
+            key=lambda name: _subclass_sort_key(
+                name,
+                subclass_by_id=subclass_by_id,
+                class_by_id=class_by_id,
+                subclass_name_to_id=subclass_name_to_id,
+            ),
+        )
+        prev_group = None
+        for subclass_name in subclass_names:
+            group = _class_name_for_subclass(
+                subclass_name,
+                subclass_by_id=subclass_by_id,
+                class_by_id=class_by_id,
+                subclass_name_to_id=subclass_name_to_id,
+            )
+            specs.append(
+                BreakdownSeriesSpec(
+                    name=subclass_name,
+                    legend_group=group,
+                    legend_group_title=group if group != prev_group else None,
+                )
+            )
+            prev_group = group
+        return specs
+
+    class_name_to_sort = {c.name: int(c.sort_order) for c in class_by_id.values()}
+    class_names = sorted(
+        seen,
+        key=lambda name: (class_name_to_sort.get(name, 10**9), name),
+    )
+    for class_name in class_names:
+        specs.append(
+            BreakdownSeriesSpec(
+                name=class_name,
+                legend_group=class_name,
+                legend_group_title=None,
+            )
+        )
+    return specs
+
+
+def _apply_breakdown_percent_view(
+    df: pd.DataFrame,
+    series_specs: list[BreakdownSeriesSpec],
+) -> pd.DataFrame:
+    out = df.copy()
+    total = out["portfolio_value"].astype(float).replace(0, pd.NA)
+    for spec in series_specs:
+        col = _value_series_col(spec.name)
+        if col in out.columns:
+            out[col] = out[col].astype(float) / total
+    return out
+
+
+def _build_breakdown_chart_df(
+    points,
+    group_mode: str,
+    *,
+    db_mtime: float = 0.0,
+) -> tuple[pd.DataFrame, list[BreakdownSeriesSpec]]:
+    subclass_by_id, class_by_id = _asset_taxonomy_maps()
+    label_cache: dict[str, str] = {}
+    ticker_subclass_ids: dict[str, int] = {}
+    if group_mode == "tickers":
+        main_tickers_key = tuple(
+            sorted(
+                {str(k).upper() for p in points for k in (p.main_ticker_values or {})}
+            )
+        )
+        if main_tickers_key:
+            ticker_subclass_ids = get_instrument_subclass_id_map(main_tickers_key)
+    elif group_mode in ("subclasses", "classes"):
+        tickers_key = tuple(sorted(_collect_breakdown_tickers(points)))
+        label_cache = _ticker_group_label_cache(tickers_key, group_mode, db_mtime)
+    seen_series: set[str] = set()
+    rows: list[dict] = []
+
+    for p in points:
+        if group_mode == "tickers":
+            main_vals = dict(p.main_ticker_values or {})
+            group_vals = {
+                str(k).upper(): float(v) for k, v in main_vals.items() if float(v) > 0
+            }
+            other_value = float(p.other_assets_value or 0.0)
+            if other_value > 0:
+                group_vals["Прочие активы"] = other_value
+        else:
+            group_vals: dict[str, float] = {}
+            ticker_vals = dict(p.ticker_values or {})
+            if not ticker_vals:
+                ticker_vals = dict(p.main_ticker_values or {})
+            for ticker, value in ticker_vals.items():
+                amount = float(value)
+                if amount <= 0:
+                    continue
+                up = str(ticker).upper()
+                label = label_cache.get(up, "—")
+                group_vals[label] = group_vals.get(label, 0.0) + amount
+
+        seen_series.update(group_vals.keys())
+        rows.append(
+            {
+                "date": p.date,
+                "portfolio_value": p.portfolio_value,
+                "_group_vals": group_vals,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, []
+    df["date"] = pd.to_datetime(df["date"])
+    series_specs = _ordered_breakdown_series_specs(
+        group_mode,
+        seen_series,
+        subclass_by_id=subclass_by_id,
+        class_by_id=class_by_id,
+        ticker_subclass_ids=ticker_subclass_ids,
+    )
+    for spec in series_specs:
+        df[_value_series_col(spec.name)] = [
+            float(row["_group_vals"].get(spec.name) or 0.0) for row in rows
+        ]
+    return df.drop(columns=["_group_vals"]), series_specs
+
+
+def _rgba(red: float, green: float, blue: float, alpha: float) -> str:
+    return f"rgba({int(red * 255)},{int(green * 255)},{int(blue * 255)},{alpha})"
+
+
+def _breakdown_series_colors(
+    series_specs: list[BreakdownSeriesSpec],
+) -> dict[str, tuple[str, str]]:
+    """
+    Distinct hue per legend group; shades of that hue within the group.
+    Returns fill/line rgba tuples (fill is more transparent).
+    """
+    groups: list[tuple[str, list[str]]] = []
+    group_index: dict[str, int] = {}
+    for spec in series_specs:
+        if spec.legend_group not in group_index:
+            group_index[spec.legend_group] = len(groups)
+            groups.append((spec.legend_group, []))
+        groups[group_index[spec.legend_group]][1].append(spec.name)
+
+    color_by_name: dict[str, tuple[str, str]] = {}
+    golden_ratio = 0.618033988749895
+    for gi, (_group, names) in enumerate(groups):
+        hue = (gi * golden_ratio) % 1.0
+        count = len(names)
+        for ni, name in enumerate(names):
+            if count == 1:
+                lightness = 0.52
+                saturation = 0.72
+            else:
+                lightness = 0.36 + (ni / (count - 1)) * 0.34
+                saturation = 0.68
+            red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+            color_by_name[name] = (
+                _rgba(red, green, blue, 0.55),
+                _rgba(red, green, blue, 0.9),
+            )
+    return color_by_name
+
+
+def _add_stacked_breakdown_trace(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    *,
+    y_col: str,
+    name: str,
+    display_ccy: str,
+    hover_label: str,
+    legend_group: str,
+    legend_group_title: str | None = None,
+    percent_mode: bool = False,
+    fill_color: str | None = None,
+    line_color: str | None = None,
+) -> None:
+    y_values = df[y_col].astype(float).fillna(0.0)
+    if percent_mode:
+        if float(y_values.sum()) <= 0:
+            return
+    elif float(y_values.sum()) <= 0:
+        return
+    if percent_mode:
+        hover_template = (
+            "Date: %{x|%m-%Y}<br>"
+            f"{hover_label}: %{{customdata:.1%}}"
+            "<extra></extra>"
+        )
+    else:
+        hover_template = (
+            "Date: %{x|%m-%Y}<br>"
+            f"{hover_label}: {display_ccy} %{{customdata:,.0f}}"
+            "<extra></extra>"
+        )
+    default_fill = "rgba(99,110,250,0.55)"
+    default_line = "rgba(99,110,250,0.9)"
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=y_values,
+            mode="lines",
+            stackgroup="portfolio",
+            line={"width": 0.5, "color": line_color or default_line},
+            fillcolor=fill_color or default_fill,
+            customdata=y_values,
+            hovertemplate=hover_template,
+            name=name,
+            legendgroup=legend_group,
+            legendgrouptitle_text=legend_group_title,
+        )
+    )
+
+
+def _render_value_breakdown_chart(
+    df: pd.DataFrame,
+    series_specs: list[BreakdownSeriesSpec],
+    *,
+    display_ccy: str,
+    height: int = 420,
+    percent_mode: bool = False,
+    cash_flow_markers: list[tuple[pd.Timestamp, str]] | None = None,
+) -> None:
+    if df.empty or df["portfolio_value"].notna().sum() == 0:
+        st.info("Недостаточно данных для графика.")
+        return
+
+    fig = go.Figure()
+    color_by_name = _breakdown_series_colors(series_specs)
+    has_any_layer = False
+    for spec in series_specs:
+        col = _value_series_col(spec.name)
+        if col not in df.columns:
+            continue
+        before = len(fig.data)
+        fill_color, line_color = color_by_name.get(spec.name, (None, None))
+        _add_stacked_breakdown_trace(
+            fig,
+            df,
+            y_col=col,
+            name=spec.name,
+            display_ccy=display_ccy,
+            hover_label=spec.name,
+            legend_group=spec.legend_group,
+            legend_group_title=spec.legend_group_title,
+            percent_mode=percent_mode,
+            fill_color=fill_color,
+            line_color=line_color,
+        )
+        if len(fig.data) > before:
+            has_any_layer = True
+
+    if not has_any_layer:
+        st.info("Недостаточно данных для графика.")
+        return
+
+    if percent_mode:
+        fig.update_yaxes(
+            title=None,
+            tickformat=".0%",
+            ticksuffix="",
+            fixedrange=True,
+        )
+    else:
+        fig.update_yaxes(
+            title=None,
+            tickprefix=f"{display_ccy} ",
+            tickformat=",.0f",
+            fixedrange=True,
+        )
+    fig.update_xaxes(
+        title=None,
+        tickformat="%m-%Y",
+        hoverformat="%m-%Y",
+        rangeslider={"visible": False},
+        fixedrange=False,
+    )
+    vline_shapes = _cash_flow_vline_shapes(
+        _cash_flow_markers_in_df_range(cash_flow_markers or [], df),
+        subplot_cols=1,
+    )
+    legend_right_margin = 180 if height >= 600 else 140
+    fig.update_layout(
+        margin={"l": 8, "r": legend_right_margin, "t": 24, "b": 24},
+        height=height,
+        hovermode="x unified",
+        dragmode="zoom",
+        shapes=vline_shapes,
+        legend={
+            "orientation": "v",
+            "yanchor": "top",
+            "y": 1,
+            "xanchor": "left",
+            "x": 1.02,
+            "tracegroupgap": 8,
+            "itemsizing": "constant",
+            "groupclick": "toggleitem",
         },
     )
     st.plotly_chart(
@@ -373,19 +1028,6 @@ def render_performance_top_metrics() -> None:
 
 
 def render_performance() -> None:
-    st.header(
-        "Доходность",
-        help=(
-            "Главная метрика доходности — MWR (XIRR) по датам и объёму денежных потоков. "
-            "Учитываются ручные вводы/выводы из раздела «Деньги». "
-            "Исторические котировки читаются только из БД; при повторном открытии "
-            "страницы в тот же день повторной загрузки с провайдеров нет. "
-            "Первичное заполнение: `python scripts/backfill_historical_quotes.py` "
-            "(повторите после новых сделок). "
-            "P&L — простая доходность (стоимость портфеля минус инвестированный капитал). "
-            "Стоимость портфеля — только по инструментам (основной + прочие)."
-        ),
-    )
     display_ccy = st.session_state.get("display_currency", "RUB")
     fx = st.session_state.get("fx_cache") or {}
     rub = float(fx.get("rub") or 95.0)
@@ -421,15 +1063,25 @@ def render_performance() -> None:
             )
             return
 
-    freq_label = st.segmented_control(
-        "Частота графиков",
-        options=["Months", "Weeks", "Days"],
-        format_func=lambda x: (
-            "Месяцы" if x == "Months" else "Недели" if x == "Weeks" else "Дни"
-        ),
-        default="Months",
-        key="perf_chart_frequency",
-    )
+    with st.container(horizontal=True, gap="small"):
+        freq_label = st.segmented_control(
+            "Частота графиков",
+            options=["Months", "Weeks", "Days"],
+            format_func=lambda x: (
+                "Месяцы" if x == "Months" else "Недели" if x == "Weeks" else "Дни"
+            ),
+            default="Months",
+            key="perf_chart_frequency",
+        )
+        show_cash_flow_lines = st.toggle(
+            "Вводы/Выводы",
+            value=False,
+            key="perf_show_cash_flow_lines",
+            help=(
+                "Вертикальные линии на графиках по датам из раздела «Ввод и вывод». "
+                "Зелёная — ввод, красная — вывод."
+            ),
+        )
     chart_frequency = (
         "monthly"
         if freq_label == "Months"
@@ -466,143 +1118,208 @@ def render_performance() -> None:
     )
     df["date"] = pd.to_datetime(df["date"])
     chart_df = _filter_chart_df_by_frequency(df, chart_frequency)
+    cash_flow_markers = (
+        _cash_flow_chart_markers(db_mtime) if show_cash_flow_lines else []
+    )
     benchmark_help_note = _synthetic_benchmark_help_note(result, display_ccy)
-    _render_performance_charts(
-        chart_df,
-        display_ccy=display_ccy,
-        benchmark_label=f"Бенчмарк ({result.benchmark_ticker})",
-    )
+    tab_overview, tab_breakdown = st.tabs(["Общая", "Разбивка"])
 
-    st.divider()
+    with tab_overview:
+        _render_performance_charts(
+            chart_df,
+            display_ccy=display_ccy,
+            benchmark_label=f"Бенчмарк ({result.benchmark_ticker})",
+            cash_flow_markers=cash_flow_markers,
+        )
 
-    # Row 1: P&L + benchmark comparison
-    benchmark_pnl = (
-        float(result.benchmark_current_value) - float(result.net_invested)
-        if result.benchmark_current_value is not None
-        else None
-    )
-    r1c1, r1c2, r1c3 = st.columns(3)
-    r1c1.metric(
-        "P&L",
-        format_money(result.total_pnl, display_ccy),
-        delta=_pnl_return_delta(result.total_pnl, result.net_invested),
-        help=(f"Простая доходность (стоимость портфеля - инвестированный капитал)."),
-    )
-    r1c2.metric(
-        f"P&L Бенчмарк",
-        format_money(benchmark_pnl, display_ccy) if benchmark_pnl is not None else "—",
-        delta=_pnl_return_delta(benchmark_pnl, result.net_invested),
-        help=(
-            f"Простая доходность бенчмарка ({result.benchmark_ticker}) "
-            f"при тех же вводах/выводах.{benchmark_help_note}"
-            if result.benchmark_ticker
-            else f"Простая доходность бенчмарка при тех же вводах/выводах.{benchmark_help_note}"
-        ),
-    )
-    r1c3.metric(
-        f"Дельта vs Бенчмарк",
-        (
-            format_money(result.benchmark_delta_value, display_ccy)
-            if result.benchmark_delta_value is not None
-            else "—"
-        ),
-        delta=_pnl_return_delta(result.benchmark_delta_value, result.total_pnl),
-        help=(
-            f"Разница текущей стоимости портфеля и фонда-бенчмарка ({result.benchmark_ticker}) "
-            f"денежного рынка в {display_ccy}.{benchmark_help_note}"
-        ),
-    )
+        st.divider()
 
-    st.divider()
+        # Row 1: P&L + benchmark comparison
+        benchmark_pnl = (
+            float(result.benchmark_current_value) - float(result.net_invested)
+            if result.benchmark_current_value is not None
+            else None
+        )
+        r1c1, r1c2, r1c3 = st.columns(3)
+        r1c1.metric(
+            "P&L",
+            format_money(result.total_pnl, display_ccy),
+            delta=_pnl_return_delta(result.total_pnl, result.net_invested),
+            help=(
+                f"Простая доходность (стоимость портфеля - инвестированный капитал)."
+            ),
+        )
+        r1c2.metric(
+            f"P&L Бенчмарк",
+            (
+                format_money(benchmark_pnl, display_ccy)
+                if benchmark_pnl is not None
+                else "—"
+            ),
+            delta=_pnl_return_delta(benchmark_pnl, result.net_invested),
+            help=(
+                f"Простая доходность бенчмарка ({result.benchmark_ticker}) "
+                f"при тех же вводах/выводах.{benchmark_help_note}"
+                if result.benchmark_ticker
+                else f"Простая доходность бенчмарка при тех же вводах/выводах.{benchmark_help_note}"
+            ),
+        )
+        r1c3.metric(
+            f"Дельта vs Бенчмарк",
+            (
+                format_money(result.benchmark_delta_value, display_ccy)
+                if result.benchmark_delta_value is not None
+                else "—"
+            ),
+            delta=_pnl_return_delta(result.benchmark_delta_value, result.total_pnl),
+            help=(
+                f"Разница текущей стоимости портфеля и фонда-бенчмарка ({result.benchmark_ticker}) "
+                f"денежного рынка в {display_ccy}.{benchmark_help_note}"
+            ),
+        )
 
-    # Row 2: MWR (XIRR + all-time cumulative MWR)
-    benchmark_all_time_mwr = next(
-        (
-            p.benchmark_mwr_cum_return
-            for p in reversed(result.points)
-            if p.benchmark_mwr_cum_return is not None
-        ),
-        None,
-    )
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    r2c1.metric(
-        "MWR (XIRR)",
-        (
-            _fmt_pct(result.mwr_xirr_annualized)
-            if result.mwr_xirr_annualized is not None
-            else "—"
-        ),
-        help="MWR в % годовых",
-    )
-    r2c2.metric(
-        "MWR (XIRR) Бенчмарк",
-        (
-            _fmt_pct(result.benchmark_mwr_xirr_annualized)
-            if result.benchmark_mwr_xirr_annualized is not None
-            else "—"
-        ),
-        help=(
-            f"MWR в % годовых если бы инвестировали в бенчмарк ({result.benchmark_ticker})."
-            f"{benchmark_help_note}"
-            if result.benchmark_ticker
-            else f"MWR бенчмарка в % годовых если бы инвестировали в бенчмарк.{benchmark_help_note}"
-        ),
-    )
-    r2c3.metric(
-        "MWR (все время)",
-        (
-            _fmt_pct(result.points[-1].mwr_cum_return)
-            if result.points[-1].mwr_cum_return is not None
-            else "—"
-        ),
-        help=f"Прибыль на каждый вложенный {display_ccy}.",
-    )
-    r2c4.metric(
-        "MWR Бенчмарк (все время)",
-        _fmt_pct(benchmark_all_time_mwr) if benchmark_all_time_mwr is not None else "—",
-        help=(
-            f"Прибыль на каждый вложенный {display_ccy} если бы инвестировали в бенчмарк ({result.benchmark_ticker})."
-            f"{benchmark_help_note}"
-            if result.benchmark_ticker
-            else f"Прибыль на каждый вложенный {display_ccy} если бы инвестировали в бенчмарк.{benchmark_help_note}"
-        ),
-    )
+        st.divider()
 
-    st.divider()
+        # Row 2: MWR (XIRR + all-time cumulative MWR)
+        benchmark_all_time_mwr = next(
+            (
+                p.benchmark_mwr_cum_return
+                for p in reversed(result.points)
+                if p.benchmark_mwr_cum_return is not None
+            ),
+            None,
+        )
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+        r2c1.metric(
+            "MWR (XIRR)",
+            (
+                _fmt_pct(result.mwr_xirr_annualized)
+                if result.mwr_xirr_annualized is not None
+                else "—"
+            ),
+            help="MWR в % годовых",
+        )
+        r2c2.metric(
+            "MWR (XIRR) Бенчмарк",
+            (
+                _fmt_pct(result.benchmark_mwr_xirr_annualized)
+                if result.benchmark_mwr_xirr_annualized is not None
+                else "—"
+            ),
+            help=(
+                f"MWR в % годовых если бы инвестировали в бенчмарк ({result.benchmark_ticker})."
+                f"{benchmark_help_note}"
+                if result.benchmark_ticker
+                else f"MWR бенчмарка в % годовых если бы инвестировали в бенчмарк.{benchmark_help_note}"
+            ),
+        )
+        r2c3.metric(
+            "MWR (все время)",
+            (
+                _fmt_pct(result.points[-1].mwr_cum_return)
+                if result.points[-1].mwr_cum_return is not None
+                else "—"
+            ),
+            help=f"Прибыль на каждый вложенный {display_ccy}.",
+        )
+        r2c4.metric(
+            "MWR Бенчмарк (все время)",
+            (
+                _fmt_pct(benchmark_all_time_mwr)
+                if benchmark_all_time_mwr is not None
+                else "—"
+            ),
+            help=(
+                f"Прибыль на каждый вложенный {display_ccy} если бы инвестировали в бенчмарк ({result.benchmark_ticker})."
+                f"{benchmark_help_note}"
+                if result.benchmark_ticker
+                else f"Прибыль на каждый вложенный {display_ccy} если бы инвестировали в бенчмарк.{benchmark_help_note}"
+            ),
+        )
 
-    # Row 3: Portfolio simple return by period
-    period = compute_period_returns(result.points, net_invested=result.net_invested)
-    r3c1, r3c2, r3c3, r3c4, r3c5, r3c6 = st.columns(6)
-    r3c1.metric("P&L - 1M", _fmt_pct(period["1M"]))
-    r3c2.metric("P&L - 3M", _fmt_pct(period["3M"]))
-    r3c3.metric("P&L - 6M", _fmt_pct(period["6M"]))
-    r3c4.metric("P&L - 1Y", _fmt_pct(period["1Y"]))
-    r3c5.metric("P&L - YTD", _fmt_pct(period["YTD"]))
-    r3c6.metric("P&L - ALL", _fmt_pct(period["ALL"]))
+        st.divider()
 
-    # Row 4: Benchmark simple return by period
-    benchmark_period = compute_benchmark_period_returns(
-        result.points, net_invested=result.net_invested
-    )
-    r4c1, r4c2, r4c3, r4c4, r4c5, r4c6 = st.columns(6)
-    r4c1.metric("P&L Бенчмарк - 1M", _fmt_pct(benchmark_period["1M"]))
-    r4c2.metric("P&L Бенчмарк - 3M", _fmt_pct(benchmark_period["3M"]))
-    r4c3.metric("P&L Бенчмарк - 6M", _fmt_pct(benchmark_period["6M"]))
-    r4c4.metric("P&L Бенчмарк - 1Y", _fmt_pct(benchmark_period["1Y"]))
-    r4c5.metric("P&L Бенчмарк - YTD", _fmt_pct(benchmark_period["YTD"]))
-    r4c6.metric("P&L Бенчмарк - ALL", _fmt_pct(benchmark_period["ALL"]))
+        # Row 3: Portfolio simple return by period
+        period = compute_period_returns(result.points, net_invested=result.net_invested)
+        r3c1, r3c2, r3c3, r3c4, r3c5, r3c6 = st.columns(6)
+        r3c1.metric("P&L - 1M", _fmt_pct(period["1M"]))
+        r3c2.metric("P&L - 3M", _fmt_pct(period["3M"]))
+        r3c3.metric("P&L - 6M", _fmt_pct(period["6M"]))
+        r3c4.metric("P&L - 1Y", _fmt_pct(period["1Y"]))
+        r3c5.metric("P&L - YTD", _fmt_pct(period["YTD"]))
+        r3c6.metric("P&L - ALL", _fmt_pct(period["ALL"]))
 
-    low_coverage_days = int((df["priced_ratio"] < 1.0).sum())
-    recent_low_coverage = int((df.tail(7)["priced_ratio"] < 1.0).sum())
-    if result.missing_price_tickers or recent_low_coverage > 0:
-        warn = []
-        if result.missing_price_tickers:
-            warn.append(
-                "Нет исторических котировок для: "
-                + ", ".join(sorted(result.missing_price_tickers))
+        # Row 4: Benchmark simple return by period
+        benchmark_period = compute_benchmark_period_returns(
+            result.points, net_invested=result.net_invested
+        )
+        r4c1, r4c2, r4c3, r4c4, r4c5, r4c6 = st.columns(6)
+        r4c1.metric("P&L Бенчмарк - 1M", _fmt_pct(benchmark_period["1M"]))
+        r4c2.metric("P&L Бенчмарк - 3M", _fmt_pct(benchmark_period["3M"]))
+        r4c3.metric("P&L Бенчмарк - 6M", _fmt_pct(benchmark_period["6M"]))
+        r4c4.metric("P&L Бенчмарк - 1Y", _fmt_pct(benchmark_period["1Y"]))
+        r4c5.metric("P&L Бенчмарк - YTD", _fmt_pct(benchmark_period["YTD"]))
+        r4c6.metric("P&L Бенчмарк - ALL", _fmt_pct(benchmark_period["ALL"]))
+
+        low_coverage_days = int((df["priced_ratio"] < 1.0).sum())
+        recent_low_coverage = int((df.tail(7)["priced_ratio"] < 1.0).sum())
+        if result.missing_price_tickers or recent_low_coverage > 0:
+            warn = []
+            if result.missing_price_tickers:
+                warn.append(
+                    "Нет исторических котировок для: "
+                    + ", ".join(sorted(result.missing_price_tickers))
+                )
+            if recent_low_coverage > 0:
+                warn.append(
+                    f"Дней с неполным покрытием цен (последние 7): {recent_low_coverage}"
+                )
+            st.warning(" | ".join(warn))
+
+    with tab_breakdown:
+        with st.container(horizontal=True, gap="small"):
+            group_label = st.segmented_control(
+                "Группировка",
+                options=["Tickers", "Subclasses", "Classes"],
+                format_func=lambda x: (
+                    "Тикеры"
+                    if x == "Tickers"
+                    else "Подклассы" if x == "Subclasses" else "Классы"
+                ),
+                default="Tickers",
+                key="perf_breakdown_group_mode",
             )
-        if recent_low_coverage > 0:
-            warn.append(
-                f"Дней с неполным покрытием цен (последние 7): {recent_low_coverage}"
+            value_label = st.segmented_control(
+                "Отображение",
+                options=["Absolute", "Percent"],
+                format_func=lambda x: "Абс." if x == "Absolute" else "%",
+                default="Percent",
+                key="perf_breakdown_value_mode",
             )
-        st.warning(" | ".join(warn))
+        group_mode = (
+            "tickers"
+            if group_label == "Tickers"
+            else "subclasses" if group_label == "Subclasses" else "classes"
+        )
+        percent_mode = value_label == "Percent"
+        breakdown_df, series_specs = _build_breakdown_chart_df(
+            result.points,
+            group_mode,
+            db_mtime=db_mtime,
+        )
+        breakdown_chart_df = _filter_chart_df_by_frequency(
+            breakdown_df, chart_frequency
+        )
+        if percent_mode:
+            breakdown_chart_df = _apply_breakdown_percent_view(
+                breakdown_chart_df,
+                series_specs,
+            )
+        _render_value_breakdown_chart(
+            breakdown_chart_df,
+            series_specs,
+            display_ccy=display_ccy,
+            height=840,
+            percent_mode=percent_mode,
+            cash_flow_markers=cash_flow_markers,
+        )
