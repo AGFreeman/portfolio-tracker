@@ -6,6 +6,7 @@ from app.services.rebalancing import (
     aggregate_values_by_subclass,
     allocate_cash_to_subclasses,
     compute_rebalance_plan,
+    compute_ticker_target_values,
     normalize_subclass_weights,
     split_subclass_budget_to_tickers,
     units_and_implied_spend,
@@ -77,6 +78,42 @@ class TestUnitsRounding(unittest.TestCase):
         self.assertAlmostEqual(spend, u * 50000.0)
 
 
+class TestTickerTargetValues(unittest.TestCase):
+    def test_equal_split_within_subclass(self):
+        rows = [
+            TickerPositionValue("AAA", 1, 60.0, 10.0),
+            TickerPositionValue("BBB", 1, 40.0, 20.0),
+        ]
+        s, targets = compute_ticker_target_values(rows, {1: 100.0})
+        self.assertAlmostEqual(s, 100.0)
+        self.assertAlmostEqual(targets["AAA"], 50.0)
+        self.assertAlmostEqual(targets["BBB"], 50.0)
+
+    def test_blocked_ticker_target_is_current_value(self):
+        rows = [
+            TickerPositionValue("AAA", 1, 60.0, 10.0),
+            TickerPositionValue("BBB", 1, 40.0, 20.0),
+        ]
+        _, targets = compute_ticker_target_values(
+            rows, {1: 100.0}, blocked_tickers={"AAA"}
+        )
+        self.assertAlmostEqual(targets["AAA"], 60.0)
+        self.assertAlmostEqual(targets["BBB"], 40.0)
+
+    def test_blocked_reserve_then_equal_split(self):
+        rows = [
+            TickerPositionValue("AAA", 1, 30.0, 10.0),
+            TickerPositionValue("BBB", 1, 20.0, 20.0),
+            TickerPositionValue("CCC", 1, 50.0, 20.0),
+        ]
+        _, targets = compute_ticker_target_values(
+            rows, {1: 100.0}, blocked_tickers={"AAA"}
+        )
+        self.assertAlmostEqual(targets["AAA"], 30.0)
+        self.assertAlmostEqual(targets["BBB"], 35.0)
+        self.assertAlmostEqual(targets["CCC"], 35.0)
+
+
 class TestComputePlan(unittest.TestCase):
     def test_end_to_end_two_tickers_one_sub(self):
         rows = [
@@ -90,8 +127,9 @@ class TestComputePlan(unittest.TestCase):
         self.assertAlmostEqual(plan.T, 200.0)
         self.assertEqual(len(plan.suggested_buys), 2)
         by_t = {b.ticker: b for b in plan.suggested_buys}
-        self.assertAlmostEqual(by_t["AAA"].spend_allocated, 50.0, places=5)
-        self.assertAlmostEqual(by_t["BBB"].spend_allocated, 50.0, places=5)
+        # Цели по 100 каждый; пробелы 40 и 60 → бюджет 100 распределяется 40/60
+        self.assertAlmostEqual(by_t["AAA"].spend_allocated, 40.0, places=5)
+        self.assertAlmostEqual(by_t["BBB"].spend_allocated, 60.0, places=5)
 
     def test_blocked_ticker_is_excluded(self):
         rows = [
@@ -103,6 +141,21 @@ class TestComputePlan(unittest.TestCase):
         plan = compute_rebalance_plan(rows, targets, names, 100.0, blocked_tickers={"AAA"})
         self.assertEqual(len(plan.suggested_buys), 1)
         self.assertEqual(plan.suggested_buys[0].ticker, "BBB")
+        self.assertAlmostEqual(plan.suggested_buys[0].spend_allocated, 100.0, places=5)
+
+    def test_blocked_reserve_splits_buy_budget(self):
+        rows = [
+            TickerPositionValue("AAA", 1, 30.0, 10.0),
+            TickerPositionValue("BBB", 1, 20.0, 20.0),
+            TickerPositionValue("CCC", 1, 50.0, 20.0),
+        ]
+        targets = {1: 100.0}
+        names = {1: "Sub1"}
+        plan = compute_rebalance_plan(rows, targets, names, 100.0, blocked_tickers={"AAA"})
+        by_t = {b.ticker: b for b in plan.suggested_buys}
+        self.assertNotIn("AAA", by_t)
+        self.assertAlmostEqual(by_t["BBB"].spend_allocated, 65.0, places=5)
+        self.assertAlmostEqual(by_t["CCC"].spend_allocated, 35.0, places=5)
 
     def test_unallocated_empty_subclass(self):
         rows = [

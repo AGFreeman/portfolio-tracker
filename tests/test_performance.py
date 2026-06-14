@@ -231,5 +231,122 @@ class TestXirr(unittest.TestCase):
         self.assertIsNone(xirr)
 
 
+class TestCostBasis(unittest.TestCase):
+    def test_all_time_unrealized_pnl_percent(self):
+        from unittest.mock import patch
+
+        from app.services.performance import (
+            PerformancePoint,
+            _unrealized_pnl_period_return,
+        )
+
+        series = [PerformancePoint("2026-06-01", 573383.0, 0.0, 0.0, None, 1.0)]
+        with patch(
+            "app.services.performance._cost_basis_for_tickers_as_of",
+            return_value=400_000.0,
+        ):
+            ret = _unrealized_pnl_period_return(
+                series,
+                ["BTC"],
+                "ALL",
+                "RUB",
+                95.0,
+                0.92,
+                pnl_display="percent",
+                net_invested=None,
+            )
+        self.assertAlmostEqual(ret, 573383.0 / 400_000.0 - 1.0, places=6)
+
+    def test_all_time_unrealized_pnl_absolute(self):
+        from unittest.mock import patch
+
+        from app.services.performance import (
+            PerformancePoint,
+            _unrealized_pnl_period_return,
+        )
+
+        series = [PerformancePoint("2026-06-01", 150.0, 0.0, 0.0, None, 1.0)]
+        with patch(
+            "app.services.performance._cost_basis_for_tickers_as_of",
+            return_value=100.0,
+        ):
+            ret = _unrealized_pnl_period_return(
+                series,
+                ["AAA"],
+                "ALL",
+                "RUB",
+                95.0,
+                0.92,
+                pnl_display="absolute",
+                net_invested=None,
+            )
+        self.assertAlmostEqual(ret, 50.0)
+
+    def test_period_unrealized_pnl_delta_percent(self):
+        from unittest.mock import patch
+
+        from app.services.performance import (
+            PerformancePoint,
+            _unrealized_pnl_period_return,
+        )
+
+        series = [
+            PerformancePoint("2025-06-01", 110.0, 0.0, 0.0, None, 1.0),
+            PerformancePoint("2026-06-01", 150.0, 0.0, 0.0, None, 1.0),
+        ]
+
+        def _basis(_tickers, _ccy, _rub, _eur, day):
+            return {"2025-06-01": 100.0, "2026-06-01": 120.0}.get(day)
+
+        with patch(
+            "app.services.performance._cost_basis_for_tickers_as_of",
+            side_effect=_basis,
+        ):
+            ret = _unrealized_pnl_period_return(
+                series,
+                ["AAA"],
+                "1Y",
+                "RUB",
+                95.0,
+                0.92,
+                pnl_display="percent",
+                net_invested=None,
+            )
+        # unrealized: 10 -> 30, delta = 20, pct = 20/100
+        self.assertAlmostEqual(ret, 0.2, places=6)
+
+    def test_period_unrealized_pnl_delta_absolute(self):
+        from unittest.mock import patch
+
+        from app.services.performance import (
+            PerformancePoint,
+            _unrealized_pnl_period_return,
+        )
+
+        series = [
+            PerformancePoint("2025-06-01", 110.0, 0.0, 0.0, None, 1.0),
+            PerformancePoint("2026-06-01", 150.0, 0.0, 0.0, None, 1.0),
+        ]
+
+        def _basis(_tickers, _ccy, _rub, _eur, day):
+            return {"2025-06-01": 100.0, "2026-06-01": 120.0}.get(day)
+
+        with patch(
+            "app.services.performance._cost_basis_for_tickers_as_of",
+            side_effect=_basis,
+        ):
+            ret = _unrealized_pnl_period_return(
+                series,
+                ["AAA"],
+                "1Y",
+                "RUB",
+                95.0,
+                0.92,
+                pnl_display="absolute",
+                net_invested=None,
+            )
+        self.assertAlmostEqual(ret, 20.0)
+
+
 if __name__ == "__main__":
     unittest.main()

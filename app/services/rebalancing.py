@@ -1,6 +1,7 @@
 """
 Buy-only rebalancing: allocate new cash across underweight asset subclasses (target %),
-then split each subclass budget across existing tickers pro-rata by current value.
+then split each subclass budget across unblocked tickers toward equal-share targets
+(blocked keep current value; residual split equally among unblocked).
 """
 from __future__ import annotations
 
@@ -75,6 +76,109 @@ def aggregate_values_by_subclass(rows: Sequence[TickerPositionValue]) -> Dict[in
         if r.value_display is not None:
             out[r.asset_subclass_id] += float(r.value_display)
     return dict(out)
+
+
+def split_ideal_sub_to_ticker_targets(
+    ideal_sub: float,
+    subclass_rows: Sequence[TickerPositionValue],
+    blocked: set[str],
+) -> Dict[str, float]:
+    """
+    Цели по тикерам внутри подкласса:
+    заблокированным — текущая стоимость; остаток ideal_sub поровну между незаблокированными.
+    """
+    blocked_reserved = 0.0
+    unblocked: List[Tuple[str, float]] = []
+    targets: Dict[str, float] = {}
+
+    for r in subclass_rows:
+        if r.value_display is None or float(r.value_display) <= 0:
+            continue
+        t_up = r.ticker.upper()
+        val = float(r.value_display)
+        if t_up in blocked:
+            targets[t_up] = val
+            blocked_reserved += val
+        else:
+            unblocked.append((r.ticker, val))
+
+    residual = float(ideal_sub) - blocked_reserved
+    for tkr, tval in split_subclass_budget_to_tickers(residual, unblocked).items():
+        targets[tkr.upper()] = float(tval)
+    return targets
+
+
+def split_subclass_budget_by_ticker_gaps(
+    budget: float,
+    ideal_sub: float,
+    subclass_rows: Sequence[TickerPositionValue],
+    blocked: set[str],
+) -> Dict[str, float]:
+    """
+    Распределить бюджет покупок между незаблокированными пропорционально
+    max(0, целевая_стоимость − текущая), где цели — split_ideal_sub_to_ticker_targets.
+    """
+    if budget <= 0:
+        return {}
+
+    targets = split_ideal_sub_to_ticker_targets(ideal_sub, subclass_rows, blocked)
+    gaps: Dict[str, float] = {}
+    for r in subclass_rows:
+        if r.value_display is None or float(r.value_display) <= 0:
+            continue
+        t_up = r.ticker.upper()
+        if t_up in blocked:
+            continue
+        target = targets.get(t_up)
+        if target is None:
+            continue
+        gap = max(0.0, float(target) - float(r.value_display))
+        if gap > 0:
+            gaps[t_up] = gap
+
+    total_gap = sum(gaps.values())
+    if total_gap <= 0:
+        return {}
+    return {t: float(budget) * g / total_gap for t, g in gaps.items()}
+
+
+def compute_ticker_target_values(
+    rows: Sequence[TickerPositionValue],
+    target_pct_by_sub: Mapping[int, float],
+    blocked_tickers: Optional[set[str]] = None,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Целевая стоимость тикеров при текущем размере портфеля (V=0):
+    ideal_sub = S × w_sub;
+    заблокированным — текущая стоимость;
+    остаток ideal_sub − Σ(целевых заблокированных) поровну между незаблокированными.
+    """
+    blocked = {x.upper() for x in (blocked_tickers or set())}
+    w, _, _ = normalize_subclass_weights(target_pct_by_sub)
+    if not w:
+        return 0.0, {}
+
+    v_by_sub = aggregate_values_by_subclass(rows)
+    for sid in w:
+        v_by_sub.setdefault(sid, 0.0)
+    s_total = sum(float(x) for x in v_by_sub.values())
+    if s_total <= 0:
+        return 0.0, {}
+
+    portfolio_total = s_total
+    rows_by_sub: Dict[int, List[TickerPositionValue]] = defaultdict(list)
+    for r in rows:
+        rows_by_sub[r.asset_subclass_id].append(r)
+
+    targets: Dict[str, float] = {}
+    for sid, weight in w.items():
+        ideal_sub = portfolio_total * float(weight)
+        subclass_targets = split_ideal_sub_to_ticker_targets(
+            ideal_sub, rows_by_sub.get(sid, []), blocked
+        )
+        targets.update(subclass_targets)
+
+    return s_total, targets
 
 
 def allocate_cash_to_subclasses(
@@ -170,32 +274,27 @@ def compute_rebalance_plan(
     # ticker -> row lookup
     by_ticker = {r.ticker.upper(): r for r in rows}
 
-    # group value by subclass (priced only)
-    tickers_by_sub: Dict[int, List[Tuple[str, float]]] = defaultdict(list)
+    rows_by_sub: Dict[int, List[TickerPositionValue]] = defaultdict(list)
     for r in rows:
-        if (
-            r.value_display is not None
-            and float(r.value_display) > 0
-            and r.ticker.upper() not in blocked
-        ):
-            tickers_by_sub[r.asset_subclass_id].append((r.ticker, float(r.value_display)))
+        rows_by_sub[r.asset_subclass_id].append(r)
 
     for sid, bud in budget_by_sub.items():
         if bud <= 1e-12:
             continue
         name = subclass_names.get(sid, str(sid))
-        tlist = tickers_by_sub.get(sid, [])
-        if not tlist:
+        subclass_rows = rows_by_sub.get(sid, [])
+        ideal_sub = T * float(w[sid])
+        alloc = split_subclass_budget_by_ticker_gaps(bud, ideal_sub, subclass_rows, blocked)
+        if not alloc:
             plan.unallocated.append(
                 SubclassBudgetUnallocated(
                     subclass_id=sid,
                     subclass_name=name,
                     budget=bud,
-                    reason="Нет доступных (не заблокированных) позиций с котировкой в этом подклассе",
+                    reason="Нет незаблокированных позиций с котировкой ниже цели в этом подклассе",
                 )
             )
             continue
-        alloc = split_subclass_budget_to_tickers(bud, tlist)
         entry_rows = []
         for tkr, spend in alloc.items():
             r = by_ticker.get(tkr.upper())

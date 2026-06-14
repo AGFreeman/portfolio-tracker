@@ -1124,3 +1124,494 @@ def compute_xirr_annualized(
             lo = mid
             f_lo = f_mid
     return None
+
+
+RETURN_PERIOD_KEYS: Tuple[str, ...] = ("ALL", "YTD", "1Y", "6M", "3M", "1M")
+
+
+def _period_start_iso(last_day: date, period: str) -> Optional[str]:
+    if period == "ALL":
+        return None
+    if period == "YTD":
+        return date(last_day.year, 1, 1).isoformat()
+    days_back = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365}.get(period)
+    if days_back is None:
+        return None
+    return (last_day - timedelta(days=days_back)).isoformat()
+
+
+def _value_series_from_points(
+    points: List[PerformancePoint],
+    *,
+    ticker_filter: Optional[Mapping[str, bool]] = None,
+    scope_tickers: Optional[Iterable[str]] = None,
+) -> List[PerformancePoint]:
+    scope_up: Optional[set[str]] = None
+    if scope_tickers is not None:
+        scope_up = {str(t or "").upper().strip() for t in scope_tickers if str(t or "").strip()}
+    out: List[PerformancePoint] = []
+    for p in points:
+        if scope_up is not None:
+            vals = dict(p.ticker_values or {})
+        else:
+            vals = dict(p.main_ticker_values or {})
+        total = 0.0
+        for ticker, value in vals.items():
+            up = str(ticker or "").upper().strip()
+            if scope_up is not None and up not in scope_up:
+                continue
+            if ticker_filter is not None and not bool(ticker_filter.get(up, False)):
+                continue
+            total += float(value)
+        out.append(
+            PerformancePoint(
+                date=p.date,
+                portfolio_value=float(total),
+                net_cash_flow=0.0,
+                twr_cum_return=0.0,
+                mwr_cum_return=None,
+                priced_ratio=1.0,
+            )
+        )
+    return out
+
+
+def _lookup_tx_value(
+    ticker: str,
+    amount: float,
+    day: str,
+    as_of_index_by_ticker: Mapping[str, Tuple[List[str], List[PriceQuote]]],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Optional[float]:
+    idx = as_of_index_by_ticker.get(str(ticker).upper())
+    if idx is None:
+        return None
+    dates, quotes = idx
+    q = _quote_as_of(list(dates), list(quotes), day)
+    if q is None or q.price is None:
+        return None
+    quote_ccy = q.currency or infer_quote_currency(ticker)
+    price = normalize_quote_price_for_valuation(ticker, q.price, quote_ccy)
+    if price is None:
+        return None
+    value_native = float(amount) * float(price)
+    return convert_amount(
+        value_native,
+        quote_ccy,
+        display_currency,
+        rub_per_usd,
+        eur_per_usd,
+    )
+
+
+def _series_value_on_or_after(
+    series: List[PerformancePoint],
+    date_iso: str,
+) -> Tuple[Optional[str], Optional[float]]:
+    by_day = {p.date: p for p in series}
+    candidates = [d for d in by_day if d >= date_iso]
+    if not candidates:
+        return None, None
+    day = min(candidates)
+    value = float(by_day[day].portfolio_value)
+    return day, value
+
+
+def _cost_basis_for_tickers_as_of(
+    tickers: Iterable[str],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    as_of_date: str,
+) -> Optional[float]:
+    """
+    Remaining cost basis for tickers using average-cost accounting, as of `as_of_date`.
+    """
+    wanted = {str(t or "").upper().strip() for t in tickers if str(t or "").strip()}
+    if not wanted:
+        return None
+    tx_by_day, first_tx_date, _last_tx_date = _load_daily_transactions()
+    if not first_tx_date:
+        return None
+    end = str(as_of_date)
+    as_of_index_by_ticker: Dict[str, Tuple[List[str], List[PriceQuote]]] = {}
+    for ticker in wanted:
+        series = _load_price_series_from_cache(ticker, first_tx_date, end)
+        series = _normalize_price_series(ticker, series)
+        as_of_index_by_ticker[ticker] = _build_as_of_price_index(series)
+
+    qty_by_ticker: Dict[str, float] = defaultdict(float)
+    cost_by_ticker: Dict[str, float] = defaultdict(float)
+    has_trade = False
+
+    for day in sorted(tx_by_day.keys()):
+        if day > end:
+            break
+        for ticker, amount, tx_type in tx_by_day[day]:
+            up = str(ticker or "").upper().strip()
+            if up not in wanted:
+                continue
+            tx_type_l = str(tx_type or "").strip().lower()
+            delta = float(amount)
+
+            if tx_type_l == "transfer":
+                qty_by_ticker[up] += delta
+                continue
+            if tx_type_l != "trade":
+                continue
+
+            tx_value = _lookup_tx_value(
+                up,
+                delta,
+                day,
+                as_of_index_by_ticker,
+                display_currency,
+                rub_per_usd,
+                eur_per_usd,
+            )
+            has_trade = True
+            if delta > 0:
+                qty_by_ticker[up] += delta
+                if tx_value is not None:
+                    cost_by_ticker[up] += float(tx_value)
+                continue
+
+            sell_qty = abs(delta)
+            held = float(qty_by_ticker.get(up, 0.0))
+            if held > 1e-12:
+                fraction = min(sell_qty / held, 1.0)
+                cost_by_ticker[up] = max(0.0, float(cost_by_ticker.get(up, 0.0)) * (1.0 - fraction))
+            qty_by_ticker[up] = held - sell_qty
+
+    if not has_trade:
+        return None
+
+    total_cost = sum(float(cost_by_ticker.get(t, 0.0)) for t in wanted)
+    if total_cost <= 0:
+        return 0.0
+    return float(total_cost)
+
+
+def _cost_basis_for_tickers(
+    tickers: Iterable[str],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Optional[float]:
+    """Remaining cost basis for tickers as of today."""
+    return _cost_basis_for_tickers_as_of(
+        tickers,
+        display_currency,
+        rub_per_usd,
+        eur_per_usd,
+        date.today().isoformat(),
+    )
+
+
+def _unrealized_pnl_at_date(
+    series: List[PerformancePoint],
+    tickers: Iterable[str],
+    as_of_date: str,
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Optional[float]:
+    """Unrealized P&L = market value − cost basis on `as_of_date`."""
+    _day, value = _series_value_on_or_after(series, as_of_date)
+    if _day is None or value is None:
+        return None
+    basis = _cost_basis_for_tickers_as_of(
+        tickers,
+        display_currency,
+        rub_per_usd,
+        eur_per_usd,
+        _day,
+    )
+    if basis is None:
+        return None
+    return float(value) - float(basis)
+
+
+def _unrealized_pnl_period_return(
+    series: List[PerformancePoint],
+    tickers: Iterable[str],
+    period: str,
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    *,
+    pnl_display: str,
+    net_invested: Optional[float],
+) -> Optional[float]:
+    """
+    Unrealized P&L for a period.
+
+    ALL: unrealized on the current remainder (value − cost basis today).
+    Other periods: change in unrealized P&L from period start to end:
+      [V_end − basis_end] − [V_start − basis_start]
+    Percent uses basis at period start as denominator.
+    """
+    _ = net_invested
+    if not series:
+        return None
+    period_up = str(period or "ALL").upper()
+    end_day = series[-1].date
+    end_value = float(series[-1].portfolio_value)
+    is_absolute = str(pnl_display or "percent").lower() == "absolute"
+
+    if period_up == "ALL":
+        end_basis = _cost_basis_for_tickers_as_of(
+            tickers, display_currency, rub_per_usd, eur_per_usd, end_day
+        )
+        if end_basis is None:
+            return None
+        if is_absolute:
+            return float(end_value) - float(end_basis)
+        if float(end_basis) <= 0:
+            return None
+        return (float(end_value) / float(end_basis)) - 1.0
+
+    last_day = datetime.strptime(end_day, "%Y-%m-%d").date()
+    start_iso = _period_start_iso(last_day, period_up)
+    if not start_iso:
+        return None
+    start_day, start_value = _series_value_on_or_after(series, start_iso)
+    if start_day is None or start_value is None:
+        return None
+
+    start_basis = _cost_basis_for_tickers_as_of(
+        tickers, display_currency, rub_per_usd, eur_per_usd, start_day
+    )
+    end_basis = _cost_basis_for_tickers_as_of(
+        tickers, display_currency, rub_per_usd, eur_per_usd, end_day
+    )
+    if start_basis is None or end_basis is None:
+        return None
+
+    unrealized_start = float(start_value) - float(start_basis)
+    unrealized_end = float(end_value) - float(end_basis)
+    delta = unrealized_end - unrealized_start
+
+    if is_absolute:
+        return float(delta)
+
+    if float(start_basis) > 0:
+        return float(delta) / float(start_basis)
+    if float(start_value) > 0:
+        return float(delta) / float(start_value)
+    return None
+
+
+def _net_invested_for_tickers(
+    tickers: Iterable[str],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Optional[float]:
+    return _cost_basis_for_tickers(
+        tickers, display_currency, rub_per_usd, eur_per_usd
+    )
+
+
+def _mwr_flows_for_tickers(
+    tickers: Iterable[str],
+    terminal_value: float,
+    terminal_day: str,
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    *,
+    period_start: Optional[str] = None,
+    start_value: Optional[float] = None,
+) -> List[Tuple[str, float]]:
+    wanted = {str(t or "").upper().strip() for t in tickers if str(t or "").strip()}
+    if not wanted:
+        return []
+    tx_by_day, first_tx_date, _last_tx_date = _load_daily_transactions()
+    if not first_tx_date:
+        return []
+    end = terminal_day
+    as_of_index_by_ticker: Dict[str, Tuple[List[str], List[PriceQuote]]] = {}
+    for ticker in wanted:
+        series = _load_price_series_from_cache(ticker, first_tx_date, end)
+        series = _normalize_price_series(ticker, series)
+        as_of_index_by_ticker[ticker] = _build_as_of_price_index(series)
+
+    flows: List[Tuple[str, float]] = []
+    if period_start and start_value is not None and float(start_value) > 0:
+        flows.append((period_start, -float(start_value)))
+
+    for day in sorted(tx_by_day.keys()):
+        if period_start and day < period_start:
+            continue
+        if day > end:
+            continue
+        for ticker, amount, tx_type in tx_by_day.get(day, []):
+            up = str(ticker or "").upper().strip()
+            if up not in wanted:
+                continue
+            if str(tx_type or "").strip().lower() != "trade":
+                continue
+            tx_value = _lookup_tx_value(
+                up,
+                float(amount),
+                day,
+                as_of_index_by_ticker,
+                display_currency,
+                rub_per_usd,
+                eur_per_usd,
+            )
+            if tx_value is None:
+                continue
+            flows.append((day, -float(tx_value)))
+
+    if float(terminal_value) > 0:
+        flows.append((terminal_day, float(terminal_value)))
+    return flows
+
+
+def _return_from_value_series(
+    series: List[PerformancePoint],
+    *,
+    metric: str,
+    period: str,
+    net_invested: Optional[float],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    tickers: Iterable[str],
+    pnl_display: str = "percent",
+) -> Optional[float]:
+    if not series:
+        return None
+    metric_up = str(metric or "PNL").upper()
+    period_up = str(period or "ALL").upper()
+    last_day = datetime.strptime(series[-1].date, "%Y-%m-%d").date()
+    last_value = float(series[-1].portfolio_value)
+    if last_value <= 0:
+        return None
+
+    if metric_up == "PNL":
+        return _unrealized_pnl_period_return(
+            series,
+            tickers,
+            period_up,
+            display_currency,
+            rub_per_usd,
+            eur_per_usd,
+            pnl_display=pnl_display,
+            net_invested=net_invested,
+        )
+
+    start_iso = _period_start_iso(last_day, period_up)
+    start_value: Optional[float] = None
+    if start_iso:
+        by_day = {p.date: p for p in series}
+        candidates = [d for d in by_day if d >= start_iso]
+        if candidates:
+            start_value = float(by_day[min(candidates)].portfolio_value)
+    elif series:
+        for p in series:
+            if float(p.portfolio_value) > 0:
+                start_value = float(p.portfolio_value)
+                start_iso = p.date
+                break
+
+    flows = _mwr_flows_for_tickers(
+        tickers,
+        last_value,
+        series[-1].date,
+        display_currency,
+        rub_per_usd,
+        eur_per_usd,
+        period_start=start_iso,
+        start_value=start_value if period_up != "ALL" else None,
+    )
+    xirr = compute_xirr_annualized(flows)
+    if xirr is None:
+        return None
+    if metric_up == "MWR_XIRR":
+        return float(xirr)
+    first_flow_day = flows[0][0] if flows else series[0].date
+    years = _years_between(first_flow_day, series[-1].date)
+    return _annualized_to_period_return(float(xirr), years)
+
+
+def compute_main_group_returns(
+    result: PerformanceResult,
+    *,
+    group_mode: str,
+    metric: str,
+    period: str,
+    main_ticker_records: List[Mapping[str, object]],
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    pnl_display: str = "percent",
+) -> Dict[str, Optional[float]]:
+    """
+    Return metric values keyed by row label for a portfolio summary table.
+
+    group_mode: Tickers | Subclasses | Classes | Currencies
+    metric: PNL | MWR | MWR_XIRR
+    period: ALL | YTD | 1Y | 6M | 3M | 1M
+    main_ticker_records: ticker rows for the portfolio slice (main or other).
+    """
+    points = list(result.points or [])
+    if not points or not main_ticker_records:
+        return {}
+
+    mode = str(group_mode or "Tickers")
+    if mode == "Storage":
+        return {}
+
+    ticker_meta: Dict[str, dict] = {}
+    for rec in main_ticker_records:
+        up = str(rec.get("ticker") or "").upper().strip()
+        if not up:
+            continue
+        ticker_meta[up] = dict(rec)
+
+    scope_tickers = set(ticker_meta.keys())
+
+    def _group_key(ticker_up: str) -> str:
+        rec = ticker_meta.get(ticker_up, {})
+        if mode == "Tickers":
+            return str(rec.get("ticker") or ticker_up)
+        if mode == "Subclasses":
+            return str(rec.get("subclass_name") or "—")
+        if mode == "Classes":
+            return str(rec.get("class_name") or "—")
+        if mode == "Currencies":
+            return str(rec.get("currency_bucket") or "USD")
+        return ticker_up
+
+    groups: Dict[str, set[str]] = defaultdict(set)
+    for up in ticker_meta:
+        groups[_group_key(up)].add(up)
+
+    out: Dict[str, Optional[float]] = {}
+    for label, tickers in groups.items():
+        ticker_filter = {t: True for t in tickers}
+        series = _value_series_from_points(
+            points,
+            ticker_filter=ticker_filter,
+            scope_tickers=scope_tickers,
+        )
+        net_invested = _net_invested_for_tickers(
+            tickers, display_currency, rub_per_usd, eur_per_usd
+        )
+        out[label] = _return_from_value_series(
+            series,
+            metric=metric,
+            period=period,
+            net_invested=net_invested,
+            display_currency=display_currency,
+            rub_per_usd=rub_per_usd,
+            eur_per_usd=eur_per_usd,
+            tickers=tickers,
+            pnl_display=pnl_display,
+        )
+    return out
