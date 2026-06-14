@@ -146,12 +146,15 @@ def compute_ticker_target_values(
     rows: Sequence[TickerPositionValue],
     target_pct_by_sub: Mapping[int, float],
     blocked_tickers: Optional[set[str]] = None,
+    portfolio_total: Optional[float] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Целевая стоимость тикеров при текущем размере портфеля (V=0):
-    ideal_sub = S × w_sub;
+    Целевая стоимость тикеров:
+    ideal_sub = portfolio_total × w_sub;
     заблокированным — текущая стоимость;
     остаток ideal_sub − Σ(целевых заблокированных) поровну между незаблокированными.
+
+    portfolio_total: база для ideal_sub (по умолчанию — текущая S из позиций).
     """
     blocked = {x.upper() for x in (blocked_tickers or set())}
     w, _, _ = normalize_subclass_weights(target_pct_by_sub)
@@ -162,17 +165,17 @@ def compute_ticker_target_values(
     for sid in w:
         v_by_sub.setdefault(sid, 0.0)
     s_total = sum(float(x) for x in v_by_sub.values())
-    if s_total <= 0:
-        return 0.0, {}
+    base_total = float(portfolio_total) if portfolio_total is not None else s_total
+    if base_total <= 0:
+        return s_total, {}
 
-    portfolio_total = s_total
     rows_by_sub: Dict[int, List[TickerPositionValue]] = defaultdict(list)
     for r in rows:
         rows_by_sub[r.asset_subclass_id].append(r)
 
     targets: Dict[str, float] = {}
     for sid, weight in w.items():
-        ideal_sub = portfolio_total * float(weight)
+        ideal_sub = base_total * float(weight)
         subclass_targets = split_ideal_sub_to_ticker_targets(
             ideal_sub, rows_by_sub.get(sid, []), blocked
         )

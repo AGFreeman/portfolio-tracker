@@ -11,10 +11,10 @@ from app.db import (
     list_buy_blocked_tickers,
     list_asset_classes,
     list_asset_subclasses,
-    get_instrument_provider,
     get_instrument_main_map,
 )
 from app.services.fx import convert_amount, format_money
+from app.services.portfolio_order import portfolio_record_sort_key
 from app.services.performance import (
     compute_current_portfolio_market_value,
     compute_main_group_returns,
@@ -54,29 +54,6 @@ _RETURN_PERIOD_LABELS = {
     "3M": "3M",
     "1M": "1M",
 }
-
-_NON_US_YF_SUFFIXES = {
-    ".AS", ".AT", ".AX", ".BE", ".BK", ".BR", ".CO", ".DE", ".DU", ".F", ".HE",
-    ".HK", ".IR", ".JK", ".JO", ".KQ", ".KS", ".L", ".LS", ".MC", ".ME", ".MI",
-    ".MX", ".NS", ".NZ", ".OL", ".PA", ".PR", ".SA", ".SG", ".SI", ".SN", ".SR",
-    ".SS", ".ST", ".SW", ".SZ", ".T", ".TA", ".TLV", ".TO", ".TSX", ".TW", ".VI",
-    ".WA",
-}
-
-
-def _is_us_exchange_ticker(ticker: str) -> bool:
-    """Heuristic: US-related = Yahoo ticker without explicit non-US suffix."""
-    up = (ticker or "").upper().strip()
-    if not up:
-        return False
-    row = get_instrument_provider(up)
-    provider = (row[0] if row else None) or ""
-    if provider in ("moex_iss", "tbank", "coingecko"):
-        return False
-    if up.endswith("-EUR") or up.endswith("-RUB"):
-        return False
-    return not any(up.endswith(sfx) for sfx in _NON_US_YF_SUFFIXES)
-
 
 def _subclass_by_id():
     global _SUBCLASS_BY_ID
@@ -416,13 +393,15 @@ def _build_main_group_rows(
     if group_mode == "Storage":
         return _rows_by_storage(records, storage_positions, qty_by_ticker, display_ccy)
 
+    sub_by_id = _subclass_by_id()
+    class_by_id = _class_by_id()
+    class_sort_by_id = {c.id: int(c.sort_order) for c in class_by_id.values()}
     sorted_records = sorted(
         records,
-        key=lambda rec: (
-            int(rec["class_sort"]),
-            int(rec["subclass_sort"]),
-            0 if _is_us_exchange_ticker(str(rec["ticker"])) else 1,
-            str(rec["ticker"]),
+        key=lambda rec: portfolio_record_sort_key(
+            rec,
+            subclass_by_id=sub_by_id,
+            class_sort_by_id=class_sort_by_id,
         ),
     )
     rows = []

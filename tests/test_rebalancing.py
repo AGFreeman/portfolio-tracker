@@ -113,6 +113,20 @@ class TestTickerTargetValues(unittest.TestCase):
         self.assertAlmostEqual(targets["BBB"], 35.0)
         self.assertAlmostEqual(targets["CCC"], 35.0)
 
+    def test_portfolio_total_override_scales_targets(self):
+        rows = [
+            TickerPositionValue("AAA", 1, 60.0, 10.0),
+            TickerPositionValue("BBB", 1, 40.0, 20.0),
+        ]
+        _, targets_at_s = compute_ticker_target_values(rows, {1: 100.0})
+        _, targets_at_t = compute_ticker_target_values(
+            rows, {1: 100.0}, portfolio_total=200.0
+        )
+        self.assertAlmostEqual(targets_at_s["AAA"], 50.0)
+        self.assertAlmostEqual(targets_at_s["BBB"], 50.0)
+        self.assertAlmostEqual(targets_at_t["AAA"], 100.0)
+        self.assertAlmostEqual(targets_at_t["BBB"], 100.0)
+
 
 class TestComputePlan(unittest.TestCase):
     def test_end_to_end_two_tickers_one_sub(self):

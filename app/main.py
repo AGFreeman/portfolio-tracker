@@ -23,6 +23,7 @@ from app.ui.currency_sidebar import render_currency_sidebar
 from app.ui.rebalancing import render_rebalancing
 from app.ui.performance import render_performance, render_performance_top_metrics
 from app.ui.diversification import render_diversification
+from app.ui.prices import render_prices
 from app.ui.cash_flows import render_cash_flows
 st.set_page_config(page_title="Портфель", layout="wide")
 # Per-rerun snapshot for quote guardrail (avoid repeated list_positions_by_ticker).
@@ -63,7 +64,7 @@ st.title("Портфель")
 render_portfolio_total_metric()
 render_performance_top_metrics()
 # Main: portfolio summary, storage breakdown, transactions, rebalancing and performance
-tab_summary, tab_diversification, tab_storage, tab_tx, tab_cash, tab_rebalance, tab_performance = st.tabs(
+tab_summary, tab_diversification, tab_storage, tab_tx, tab_cash, tab_rebalance, tab_performance, tab_prices = st.tabs(
     [
         "Сводка портфеля",
         "Диверсификация",
@@ -72,6 +73,7 @@ tab_summary, tab_diversification, tab_storage, tab_tx, tab_cash, tab_rebalance, 
         "Деньги",
         "Ребалансировка",
         "Доходность",
+        "Котировки",
     ]
 )
 with tab_summary:
@@ -88,3 +90,5 @@ with tab_rebalance:
     render_rebalancing()
 with tab_performance:
     render_performance()
+with tab_prices:
+    render_prices()

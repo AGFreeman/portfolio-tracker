@@ -5,7 +5,6 @@ import pandas as pd
 import streamlit as st
 
 from app.db import (
-    get_instrument_provider,
     list_buy_blocked_tickers,
     list_asset_classes,
     list_asset_subclasses,
@@ -14,75 +13,50 @@ from app.db import (
     set_portfolio_blocked,
 )
 from app.services.fx import convert_amount, format_money
-from app.services.price_currency import infer_quote_currency
+from app.services.portfolio_order import build_portfolio_ticker_order
+from app.services.price_currency import resolve_quote_currency
 from app.services.prices import (
     get_app_quotes,
     is_crypto_ticker,
     normalize_quote_price_for_valuation,
     request_quotes_refresh,
 )
-from app.services.rebalancing import TickerPositionValue, compute_rebalance_plan
+from app.services.rebalancing import (
+    TickerPositionValue,
+    compute_rebalance_plan,
+    compute_ticker_target_values,
+)
 
-_NON_US_YF_SUFFIXES = {
-    ".AS",
-    ".AT",
-    ".AX",
-    ".BE",
-    ".BK",
-    ".BR",
-    ".CO",
-    ".DE",
-    ".DU",
-    ".F",
-    ".HE",
-    ".HK",
-    ".IR",
-    ".JK",
-    ".JO",
-    ".KQ",
-    ".KS",
-    ".L",
-    ".LS",
-    ".MC",
-    ".ME",
-    ".MI",
-    ".MX",
-    ".NS",
-    ".NZ",
-    ".OL",
-    ".PA",
-    ".PR",
-    ".SA",
-    ".SG",
-    ".SI",
-    ".SN",
-    ".SR",
-    ".SS",
-    ".ST",
-    ".SW",
-    ".SZ",
-    ".T",
-    ".TA",
-    ".TLV",
-    ".TO",
-    ".TSX",
-    ".TW",
-    ".VI",
-    ".WA",
+_STORAGE_GROUPS = ("Foreign Brokers", "Russian Brokers", "Crypto")
+_STORAGE_GROUP_LABELS = {
+    "Foreign Brokers": "Зарубежные брокеры",
+    "Russian Brokers": "Российские брокеры",
+    "Crypto": "Крипто",
 }
+_REBALANCE_TABLE_COLUMNS = (
+    "Подкласс",
+    "Тикер",
+    "Кол-во",
+    "Сумма",
+    "Цель",
+    "Откл до",
+    "Откл после",
+)
 
 
-def _is_us_exchange_ticker(ticker: str) -> bool:
-    up = (ticker or "").upper().strip()
-    if not up:
-        return False
-    row = get_instrument_provider(up)
-    provider = (row[0] if row else None) or ""
-    if provider in ("moex_iss", "tbank", "coingecko"):
-        return False
-    if up.endswith("-EUR") or up.endswith("-RUB"):
-        return False
-    return not any(up.endswith(sfx) for sfx in _NON_US_YF_SUFFIXES)
+def _sort_buy_entries(
+    buy_entries: list[dict],
+    *,
+    ticker_order: dict[str, int],
+) -> list[dict]:
+    """Same row order as the main portfolio summary table (Tickers view)."""
+    return sorted(
+        buy_entries,
+        key=lambda x: (
+            ticker_order.get(str(x["ticker"]).upper(), 10**9),
+            str(x["ticker"]).upper(),
+        ),
+    )
 
 
 def _storage_group(storage_name: str) -> str | None:
@@ -120,6 +94,177 @@ def _storage_group(storage_name: str) -> str | None:
     ):
         return "Crypto"
     return None
+
+
+def _spend_by_storage_group(
+    ticker: str,
+    implied_spend: float,
+    storages_by_ticker_unblocked: dict[str, list[str]],
+) -> dict[str, float]:
+    storage_names = storages_by_ticker_unblocked.get(str(ticker).upper(), [])
+    if not storage_names or implied_spend <= 0:
+        return {}
+    per_storage = float(implied_spend) / float(len(storage_names))
+    by_group: dict[str, float] = defaultdict(float)
+    for storage_name in storage_names:
+        grp = _storage_group(storage_name)
+        if grp in _STORAGE_GROUPS:
+            by_group[grp] += per_storage
+    return dict(by_group)
+
+
+def _format_signed_money(value: float, currency: str) -> str:
+    sym = {"RUB": "₽", "USD": "$", "EUR": "€"}.get(currency.upper(), currency)
+    if value >= 0:
+        return f"+{value:,.2f} {sym}"
+    return f"{value:,.2f} {sym}"
+
+
+def _format_buy_qty(ticker: str, units: float) -> str:
+    if units == int(units) and not is_crypto_ticker(ticker):
+        return str(int(units))
+    if is_crypto_ticker(ticker):
+        return str(round(float(units), 8))
+    return str(int(units)) if units == int(units) else f"{float(units):.4f}"
+
+
+def _ticker_deviation_cells(
+    *,
+    cur_value: float,
+    post_value: float,
+    target_before: float | None,
+    target_after: float | None,
+    total_before: float,
+    total_after: float,
+    display_ccy: str,
+    percent_mode: bool,
+) -> tuple[str, str, str]:
+    if target_before is None or total_before <= 0:
+        target_cell = "—"
+        dev_before = "—"
+    elif percent_mode:
+        target_cell = f"{target_before / total_before * 100.0:.1f}%"
+        dev_before = f"{(cur_value / total_before * 100.0 - target_before / total_before * 100.0):+.1f}"
+    else:
+        target_cell = f"{target_before / total_before * 100.0:.1f}%"
+        dev_before = _format_signed_money(cur_value - target_before, display_ccy)
+
+    if target_after is None or total_after <= 0:
+        dev_after = "—"
+    elif percent_mode:
+        dev_after = f"{(post_value / total_after * 100.0 - target_after / total_after * 100.0):+.1f}"
+    else:
+        dev_after = _format_signed_money(post_value - target_after, display_ccy)
+
+    return target_cell, dev_before, dev_after
+
+
+def _build_rebalance_table_row(
+    *,
+    ticker: str,
+    subclass_name: str,
+    units: float,
+    group_spend_display: float,
+    quote_ccy: str,
+    price_native: float,
+    display_ccy: str,
+    rub: float,
+    eur: float,
+    cur_value: float,
+    total_buy: float,
+    target_before: float | None,
+    target_after: float | None,
+    total_before: float,
+    total_after: float,
+    percent_mode: bool,
+) -> dict:
+    if price_native > 0:
+        native_spend = float(units) * float(price_native)
+    else:
+        native_spend = convert_amount(
+            float(group_spend_display), display_ccy, quote_ccy, rub, eur
+        )
+    post_value = float(cur_value) + float(total_buy)
+    target_cell, dev_before, dev_after = _ticker_deviation_cells(
+        cur_value=float(cur_value),
+        post_value=post_value,
+        target_before=target_before,
+        target_after=target_after,
+        total_before=total_before,
+        total_after=total_after,
+        display_ccy=display_ccy,
+        percent_mode=percent_mode,
+    )
+    return {
+        "Подкласс": subclass_name,
+        "Тикер": ticker,
+        "Кол-во": _format_buy_qty(ticker, units),
+        "Сумма": format_money(native_spend, quote_ccy),
+        "Цель": target_cell,
+        "Откл до": dev_before,
+        "Откл после": dev_after,
+    }
+
+
+def _build_group_table_rows(
+    buy_entries: list[dict],
+    *,
+    group: str,
+    ticker_order: dict[str, int],
+    storages_by_ticker_unblocked: dict[str, list[str]],
+    quote_ccy_by_ticker: dict[str, str],
+    price_native_by_ticker: dict[str, float],
+    value_by_ticker: dict[str, float],
+    target_at_s: dict[str, float],
+    target_at_t: dict[str, float],
+    total_before: float,
+    total_after: float,
+    display_ccy: str,
+    rub: float,
+    eur: float,
+    percent_mode: bool,
+) -> list[dict]:
+    rows: list[dict] = []
+    for b in _sort_buy_entries(buy_entries, ticker_order=ticker_order):
+        ticker = str(b["ticker"])
+        t_up = ticker.upper()
+        spend_by_group = _spend_by_storage_group(
+            ticker, float(b["implied_spend"]), storages_by_ticker_unblocked
+        )
+        group_spend = float(spend_by_group.get(group, 0.0))
+        if group_spend <= 1e-9:
+            continue
+        total_spend = float(b["implied_spend"])
+        units = float(b["units"])
+        if total_spend > 0 and abs(group_spend - total_spend) > 1e-9:
+            units = units * (group_spend / total_spend)
+        rows.append(
+            _build_rebalance_table_row(
+                ticker=ticker,
+                subclass_name=str(b["subclass_name"]),
+                units=units,
+                group_spend_display=group_spend,
+                quote_ccy=quote_ccy_by_ticker.get(t_up, display_ccy),
+                price_native=float(price_native_by_ticker.get(t_up, 0.0)),
+                display_ccy=display_ccy,
+                rub=rub,
+                eur=eur,
+                cur_value=float(value_by_ticker.get(t_up, 0.0)),
+                total_buy=total_spend,
+                target_before=target_at_s.get(t_up),
+                target_after=target_at_t.get(t_up),
+                total_before=total_before,
+                total_after=total_after,
+                percent_mode=percent_mode,
+            )
+        )
+    return rows
+
+
+def _as_rebalance_dataframe(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=list(_REBALANCE_TABLE_COLUMNS))
+    return pd.DataFrame(rows)[list(_REBALANCE_TABLE_COLUMNS)]
 
 
 def _build_group_funding_plan(
@@ -258,7 +403,7 @@ def _render_blocked_tickers_dialog() -> None:
             st.rerun()
 
 
-def render_rebalancing():
+def _render_rebalancing_body():
     st.header(
         "Ребалансировка",
         help=(
@@ -312,7 +457,6 @@ def render_rebalancing():
     subclasses = list_asset_subclasses()
     target_pct = {s.id: float(s.target_pct) for s in subclasses}
     sub_names = {s.id: s.name for s in subclasses}
-    class_names = {c.id: c.name for c in classes}
 
     storage_block_rows = list_portfolio_blocks(main_only=True)
     blocked_current = {
@@ -329,14 +473,19 @@ def render_rebalancing():
 
     price_tickers = sorted({t.upper() for t in tickers} | {t.upper() for t in blocked})
     quotes = get_app_quotes(price_tickers) if price_tickers else {}
+    quote_ccy_by_ticker: dict[str, str] = {}
+    price_native_by_ticker: dict[str, float] = {}
 
     rows: list[TickerPositionValue] = []
     for p in positions:
         q = quotes.get(p.ticker)
         raw_price = q.price if q else None
-        quote_ccy = q.currency if q else infer_quote_currency(p.ticker)
+        quote_ccy = resolve_quote_currency(p.ticker, q.currency if q else None)
+        t_up = str(p.ticker).upper()
+        quote_ccy_by_ticker[t_up] = quote_ccy
         price = normalize_quote_price_for_valuation(p.ticker, raw_price, quote_ccy)
         if price is not None:
+            price_native_by_ticker[t_up] = float(price)
             price_disp = convert_amount(price, quote_ccy, display_ccy, rub, eur)
             value_native = price * p.amount
             value_disp = convert_amount(value_native, quote_ccy, display_ccy, rub, eur)
@@ -390,15 +539,8 @@ def render_rebalancing():
                 f"{u.reason}. Добавьте позицию с ценой или выберите тикер вручную."
             )
 
-    current_by_sub = defaultdict(float)
-    for r in rows:
-        if r.value_display is not None:
-            current_by_sub[r.asset_subclass_id] += float(r.value_display)
-
-    total_before = float(plan.S)
-    # "After" percentages should reflect only фактически размещенные покупки.
-    total_after = float(plan.S + plan.total_implied_spend)
-    unalloc_by_sub = {u.subclass_id: float(u.budget) for u in plan.unallocated}
+    if warnings:
+        process_messages_warnings.extend(warnings)
 
     if run_v <= 0:
         process_messages_warnings.append(
@@ -409,11 +551,13 @@ def render_rebalancing():
             "После увеличения капитала нет подклассов ниже цели; дополнительные покупки могут усилить текущий перекос."
         )
 
-    if warnings:
-        process_messages_warnings.extend(warnings)
-
     subclass_by_id = {s.id: s for s in subclasses}
     class_sort_by_id = {c.id: int(c.sort_order) for c in classes}
+    ticker_order = build_portfolio_ticker_order(
+        [(r.ticker, int(r.asset_subclass_id)) for r in rows],
+        subclass_by_id=subclass_by_id,
+        class_sort_by_id=class_sort_by_id,
+    )
 
     storages_by_ticker_unblocked: dict[str, list[str]] = defaultdict(list)
     for r in storage_block_rows:
@@ -437,25 +581,7 @@ def render_rebalancing():
         }
         for b in plan.suggested_buys
     ]
-    buys_sorted = sorted(
-        buy_entries,
-        key=lambda x: (
-            (
-                class_sort_by_id.get(
-                    subclass_by_id.get(x["asset_subclass_id"]).asset_class_id, 10**9
-                )
-                if subclass_by_id.get(x["asset_subclass_id"])
-                else 10**9
-            ),
-            (
-                int(subclass_by_id.get(x["asset_subclass_id"]).sort_order)
-                if subclass_by_id.get(x["asset_subclass_id"])
-                else 10**9
-            ),
-            0 if _is_us_exchange_ticker(x["ticker"]) else 1,
-            x["ticker"],
-        ),
-    )
+    buys_sorted = _sort_buy_entries(buy_entries, ticker_order=ticker_order)
     for b in buys_sorted:
         ticker_unblocked_storages = storages_by_ticker_unblocked.get(
             str(b["ticker"]).upper(), []
@@ -570,77 +696,16 @@ def render_rebalancing():
             if float(e["units"]) > 0 or float(e["implied_spend"]) > 0
         ]
 
-    spend_by_sub = defaultdict(float)
-    for b in buy_entries:
-        spend_by_sub[int(b["asset_subclass_id"])] += float(b["implied_spend"])
+    total_before = float(plan.S)
+    _, target_at_s = compute_ticker_target_values(rows, target_pct, blocked)
+    _, target_at_t = compute_ticker_target_values(
+        rows, target_pct, blocked, portfolio_total=float(plan.T)
+    )
+    value_by_ticker = {
+        str(r.ticker).upper(): float(r.value_display or 0.0) for r in rows
+    }
 
     total_after = float(plan.S + sum(float(e["implied_spend"]) for e in buy_entries))
-    subclass_meta_rows = []
-    for s in sorted(subclasses, key=lambda x: (x.asset_class_id, x.sort_order)):
-        cur_val = float(current_by_sub.get(s.id, 0.0))
-        buy_val = float(spend_by_sub.get(s.id, 0.0))
-        buy_budget_only = float(unalloc_by_sub.get(s.id, 0.0))
-        post_val = cur_val + buy_val
-        target = float(s.target_pct)
-        before_pct = (cur_val / total_before * 100.0) if total_before > 0 else 0.0
-        after_pct = (post_val / total_after * 100.0) if total_after > 0 else before_pct
-        dev_before = before_pct - target
-        dev_after = after_pct - target
-        subclass_meta_rows.append(
-            {
-                "class_name": class_names.get(s.asset_class_id, "—"),
-                "subclass_name": s.name,
-                "target_pct": target,
-                "dev_before": dev_before,
-                "dev_after": dev_after,
-                "buy_budget_only": buy_budget_only,
-            }
-        )
-    meta_by_subclass_name = {r["subclass_name"]: r for r in subclass_meta_rows}
-    table_rows = []
-    buys_sorted = sorted(
-        buy_entries,
-        key=lambda x: (
-            (
-                class_sort_by_id.get(
-                    subclass_by_id.get(x["asset_subclass_id"]).asset_class_id, 10**9
-                )
-                if subclass_by_id.get(x["asset_subclass_id"])
-                else 10**9
-            ),
-            (
-                int(subclass_by_id.get(x["asset_subclass_id"]).sort_order)
-                if subclass_by_id.get(x["asset_subclass_id"])
-                else 10**9
-            ),
-            0 if _is_us_exchange_ticker(str(x["ticker"])) else 1,
-            str(x["ticker"]),
-        ),
-    )
-    for b in buys_sorted:
-        meta = meta_by_subclass_name.get(str(b["subclass_name"]), {})
-        qty_disp = (
-            int(b["units"])
-            if b["units"] == int(b["units"])
-            else round(float(b["units"]), 8)
-        )
-        table_rows.append(
-            {
-                "Класс": meta.get("class_name", "—"),
-                "Подкласс": b["subclass_name"],
-                "Цель, %": f"{float(meta.get('target_pct', 0.0)):.3f}",
-                "Отклонение до, п.п.": f"{float(meta.get('dev_before', 0.0)):+.3f}",
-                "Тикер": b["ticker"],
-                "Количество к покупке": str(qty_disp),
-                f"Купить на сумму ({display_ccy})": format_money(
-                    float(b["implied_spend"]), display_ccy
-                ),
-                f"Не размещено ({display_ccy})": format_money(
-                    float(meta.get("buy_budget_only", 0.0)), display_ccy
-                ),
-                "Отклонение после, п.п.": f"{float(meta.get('dev_after', 0.0)):+.3f}",
-            }
-        )
 
     # Keep strict rounded group plan authoritative (step = 1,000 RUB).
     # Realized per-instrument spends may deviate due lot/fraction constraints.
@@ -672,6 +737,41 @@ def render_rebalancing():
     g4.metric(
         "Unsettled Cash", format_money(float(unsettled_after_groups), display_ccy)
     )
+
+    if run_v > 0:
+        deviation_mode = st.segmented_control(
+            "Отклонение",
+            options=["Percent", "Absolute"],
+            format_func=lambda x: "%" if x == "Percent" else "Абс.",
+            default="Percent",
+            key="rebalance_deviation_mode",
+            width="content",
+        )
+        percent_mode = deviation_mode == "Percent"
+        table_rows_by_group = {
+            group: _build_group_table_rows(
+                buy_entries,
+                group=group,
+                ticker_order=ticker_order,
+                storages_by_ticker_unblocked=storages_by_ticker_unblocked,
+                quote_ccy_by_ticker=quote_ccy_by_ticker,
+                price_native_by_ticker=price_native_by_ticker,
+                value_by_ticker=value_by_ticker,
+                target_at_s=target_at_s,
+                target_at_t=target_at_t,
+                total_before=total_before,
+                total_after=total_after,
+                display_ccy=display_ccy,
+                rub=rub,
+                eur=eur,
+                percent_mode=percent_mode,
+            )
+            for group in _STORAGE_GROUPS
+        }
+    else:
+        deviation_mode = "Percent"
+        table_rows_by_group = {group: [] for group in _STORAGE_GROUPS}
+
     grouped_plus_unsettled = (
         float(group_totals["Foreign Brokers"])
         + float(group_totals["Russian Brokers"])
@@ -725,13 +825,30 @@ def render_rebalancing():
         with st.popover("Инфо по расчету ребалансировки", width="stretch"):
             for msg in process_messages:
                 st.markdown(f"- {msg}")
-    if table_rows:
-        st.dataframe(
-            table_rows,
-            width="stretch",
-            height=700,
-            hide_index=True,
-            key="rebalance_full_table_df",
-        )
-    else:
+
+    if run_v <= 0:
+        st.info("Укажите сумму больше 0 и нажмите «Рассчитать покупки».")
+    elif not any(table_rows_by_group.values()):
         st.info("Нет доступных покупок по текущим условиям ребалансировки.")
+    else:
+        for group in _STORAGE_GROUPS:
+            group_rows = table_rows_by_group[group]
+            st.subheader(_STORAGE_GROUP_LABELS[group])
+            if group_rows:
+                st.dataframe(
+                    _as_rebalance_dataframe(group_rows),
+                    width="stretch",
+                    hide_index=True,
+                    column_order=list(_REBALANCE_TABLE_COLUMNS),
+                    key=f"rebalance_{group.lower().replace(' ', '_')}_{deviation_mode}_df",
+                )
+            else:
+                st.caption("Нет покупок для этой группы.")
+
+
+def render_rebalancing():
+    @st.fragment
+    def _fragment():
+        _render_rebalancing_body()
+
+    _fragment()
