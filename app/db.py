@@ -133,14 +133,23 @@ def _ensure_portfolio_table(conn: sqlite3.Connection) -> None:
     if "main" not in cols:
         conn.execute(f"ALTER TABLE {_PORTFOLIO_TABLE} ADD COLUMN main INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute(f"PRAGMA table_info({_PORTFOLIO_TABLE})").fetchall()
+    }
+    if "sellable" not in cols:
+        conn.execute(
+            f"ALTER TABLE {_PORTFOLIO_TABLE} ADD COLUMN sellable INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 def _sync_portfolio_table(conn: sqlite3.Connection) -> None:
     """Синхронизировать таблицу блокировок со списком текущих позиций (> 0)."""
     conn.execute(
         f"""
-        INSERT INTO {_PORTFOLIO_TABLE} (ticker, storage_id, blocked, main)
-        SELECT p.ticker, p.storage_id, 0,
+        INSERT INTO {_PORTFOLIO_TABLE} (ticker, storage_id, blocked, sellable, main)
+        SELECT p.ticker, p.storage_id, 0, 0,
                COALESCE((SELECT MAX(COALESCE(b2.main, 0))
                          FROM {_PORTFOLIO_TABLE} b2
                          WHERE b2.ticker = p.ticker), 0)
@@ -167,6 +176,27 @@ def _sync_portfolio_table(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+
+def _ensure_storage_rebalance_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute("PRAGMA table_info(storages)").fetchall()
+    }
+    if "rebalance_deposit" not in cols:
+        conn.execute(
+            "ALTER TABLE storages ADD COLUMN rebalance_deposit INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.commit()
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute("PRAGMA table_info(storages)").fetchall()
+    }
+    if "rebalance_withdraw" not in cols:
+        conn.execute(
+            "ALTER TABLE storages ADD COLUMN rebalance_withdraw INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 def _migrate_legacy_ticker_blocks_to_storage(conn: sqlite3.Connection) -> None:
@@ -568,6 +598,7 @@ def init_db():
         _drop_legacy_block_columns_from_instruments(conn)
         _migrate_nbis_transactions_to_yndx(conn)
         _migrate_ydex_conversion_quote_gap(conn)
+        _ensure_storage_rebalance_columns(conn)
         # Rename legacy table if it still exists from older schema name.
         has_legacy_cf = conn.execute(
             f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{_LEGACY_CASH_FLOWS_TABLE}' LIMIT 1"
@@ -1576,7 +1607,8 @@ def list_portfolio_blocks(main_only: bool = False) -> List[Dict[str, object]]:
                 SELECT b.ticker,
                        b.storage_id,
                        COALESCE(s.name, '—') AS storage_name,
-                       COALESCE(b.blocked, 0) AS blocked
+                       COALESCE(b.blocked, 0) AS blocked,
+                       COALESCE(b.sellable, 0) AS sellable
                 FROM portfolio b
                 LEFT JOIN storages s ON s.id = b.storage_id
                 WHERE COALESCE(b.main, 0) = 1
@@ -1589,7 +1621,8 @@ def list_portfolio_blocks(main_only: bool = False) -> List[Dict[str, object]]:
                 SELECT b.ticker,
                        b.storage_id,
                        COALESCE(s.name, '—') AS storage_name,
-                       COALESCE(b.blocked, 0) AS blocked
+                       COALESCE(b.blocked, 0) AS blocked,
+                       COALESCE(b.sellable, 0) AS sellable
                 FROM portfolio b
                 LEFT JOIN storages s ON s.id = b.storage_id
                 ORDER BY b.ticker, storage_name
@@ -1601,9 +1634,38 @@ def list_portfolio_blocks(main_only: bool = False) -> List[Dict[str, object]]:
                 "storage_id": int(r["storage_id"]),
                 "storage_name": str(r["storage_name"] or "—"),
                 "blocked": int(r["blocked"] or 0) == 1,
+                "sellable": int(r["sellable"] or 0) == 1,
             }
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+def list_sellable_tickers(main_only: bool = False) -> List[str]:
+    conn = get_conn()
+    try:
+        _sync_portfolio_table(conn)
+        if main_only:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ticker
+                FROM portfolio
+                WHERE COALESCE(sellable, 0) = 1
+                  AND COALESCE(main, 0) = 1
+                ORDER BY ticker
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ticker
+                FROM portfolio
+                WHERE COALESCE(sellable, 0) = 1
+                ORDER BY ticker
+                """
+            ).fetchall()
+        return [str(r["ticker"]).upper() for r in rows]
     finally:
         conn.close()
 
@@ -1622,6 +1684,26 @@ def set_portfolio_blocked(ticker: str, storage_id: int, blocked: bool) -> None:
             WHERE ticker = ? AND storage_id = ?
             """,
             (1 if blocked else 0, t, sid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_portfolio_sellable(ticker: str, storage_id: int, sellable: bool) -> None:
+    """Поставить/снять разрешение продажи для пары (тикер, место хранения)."""
+    t = ticker.strip().upper()
+    sid = int(storage_id)
+    conn = get_conn()
+    try:
+        _sync_portfolio_table(conn)
+        conn.execute(
+            """
+            UPDATE portfolio
+            SET sellable = ?, updated_at = datetime('now')
+            WHERE ticker = ? AND storage_id = ?
+            """,
+            (1 if sellable else 0, t, sid),
         )
         conn.commit()
     finally:
@@ -1662,14 +1744,57 @@ def list_storages() -> List[Storage]:
     conn = get_conn()
     try:
         rows = conn.execute(
-            "SELECT id, name, sort_order FROM storages ORDER BY sort_order, name"
+            """
+            SELECT id, name, sort_order,
+                   COALESCE(rebalance_deposit, 1) AS rebalance_deposit,
+                   COALESCE(rebalance_withdraw, 0) AS rebalance_withdraw
+            FROM storages
+            ORDER BY sort_order, name
+            """
         ).fetchall()
         if not rows:
             get_default_storage_id()
             rows = conn.execute(
-                "SELECT id, name, sort_order FROM storages ORDER BY sort_order, name"
+                """
+                SELECT id, name, sort_order,
+                       COALESCE(rebalance_deposit, 1) AS rebalance_deposit,
+                       COALESCE(rebalance_withdraw, 0) AS rebalance_withdraw
+                FROM storages
+                ORDER BY sort_order, name
+                """
             ).fetchall()
-        return [Storage(int(r["id"]), r["name"], int(r["sort_order"])) for r in rows]
+        return [
+            Storage(
+                int(r["id"]),
+                r["name"],
+                int(r["sort_order"]),
+                rebalance_deposit=int(r["rebalance_deposit"] or 0) == 1,
+                rebalance_withdraw=int(r["rebalance_withdraw"] or 0) == 1,
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def set_storage_rebalance_flags(
+    storage_id: int,
+    *,
+    deposit: bool,
+    withdraw: bool,
+) -> None:
+    sid = int(storage_id)
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE storages
+            SET rebalance_deposit = ?, rebalance_withdraw = ?
+            WHERE id = ?
+            """,
+            (1 if deposit else 0, 1 if withdraw else 0, sid),
+        )
+        conn.commit()
     finally:
         conn.close()
 

@@ -27,6 +27,8 @@ class Storage:
     id: int
     name: str
     sort_order: int
+    rebalance_deposit: bool = True
+    rebalance_withdraw: bool = False
 
 
 @dataclass

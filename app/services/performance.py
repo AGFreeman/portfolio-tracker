@@ -1310,6 +1310,30 @@ def _cost_basis_for_tickers(
     )
 
 
+def compute_ticker_unrealized_pnl_pct(
+    ticker: str,
+    market_value_display: float,
+    display_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+) -> Optional[float]:
+    """
+    Unrealized P&L % for a single ticker (period ALL): market_value / cost_basis − 1.
+    Returns None when basis cannot be computed or market value is not positive.
+    """
+    if float(market_value_display) <= 0:
+        return None
+    up = str(ticker or "").upper().strip()
+    if not up:
+        return None
+    basis = _cost_basis_for_tickers(
+        [up], display_currency, rub_per_usd, eur_per_usd
+    )
+    if basis is None or float(basis) <= 0:
+        return None
+    return float(market_value_display) / float(basis) - 1.0
+
+
 def _unrealized_pnl_at_date(
     series: List[PerformancePoint],
     tickers: Iterable[str],
