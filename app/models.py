@@ -29,6 +29,7 @@ class Storage:
     sort_order: int
     rebalance_deposit: bool = True
     rebalance_withdraw: bool = False
+    taxable: bool = False
 
 
 @dataclass

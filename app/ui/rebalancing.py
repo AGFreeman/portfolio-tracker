@@ -19,6 +19,7 @@ from app.db import (
     set_portfolio_blocked,
     set_portfolio_sellable,
     set_storage_rebalance_flags,
+    set_storage_taxable_flag,
 )
 from app.services.fx import convert_amount, format_money
 from app.services.performance import compute_ticker_unrealized_pnl_pct
@@ -40,10 +41,12 @@ from app.services.rebalancing import (
     compute_constrained_rebalance_plan,
     compute_ticker_target_values,
 )
+from app.services.tax import compute_rebalance_tax_summary
 
 _REBALANCE_MIN_PURCHASE_SETTING = "rebalance_min_purchase_amount"
 _REBALANCE_MIN_DEPOSIT_SETTING = "rebalance_min_deposit_amount"
 _REBALANCE_BUY_ALLOCATION_SETTING = "rebalance_buy_allocation_mode"
+_REBALANCE_TAX_RATE_SETTING = "rebalance_tax_rate"
 _BUY_ALLOCATION_OPTIONS = ("max_gap", "proportional")
 
 
@@ -68,6 +71,24 @@ def _persist_rebalance_limits(
     set_app_setting(_REBALANCE_MIN_DEPOSIT_SETTING, str(min_deposit))
     if buy_mode in _BUY_ALLOCATION_OPTIONS:
         set_app_setting(_REBALANCE_BUY_ALLOCATION_SETTING, str(buy_mode))
+
+
+def _read_tax_settings() -> tuple[float, dict[int, bool]]:
+    stored_rate = get_app_setting(_REBALANCE_TAX_RATE_SETTING)
+    rate = float(stored_rate) if stored_rate not in (None, "") else 0.13
+    taxable_by_id = {int(s.id): bool(s.taxable) for s in list_storages()}
+    return rate, taxable_by_id
+
+
+def _persist_tax_settings(rate_pct: float, edited_rows: list[dict], current: list[dict]) -> None:
+    rate = max(0.0, float(rate_pct)) / 100.0
+    set_app_setting(_REBALANCE_TAX_RATE_SETTING, str(rate))
+    id_by_name = {str(r["name"]): int(r["id"]) for r in current}
+    for row in edited_rows:
+        storage_id = id_by_name.get(str(row["Место хранения"]))
+        if storage_id is None:
+            continue
+        set_storage_taxable_flag(storage_id, taxable=bool(row["Облагается налогом"]))
 
 
 _STORAGE_GROUPS = ("Foreign Brokers", "Russian Brokers", "Crypto")
@@ -855,8 +876,8 @@ def _persist_storage_cash_flow_settings(
 @st.dialog("Настройки ребалансировки", width="medium")
 def _render_rebalance_settings_dialog() -> None:
     display_ccy = st.session_state.get("display_currency", "RUB")
-    tab_instruments, tab_storages, tab_limits = st.tabs(
-        ["Инструменты", "Места хранения", "Ограничения"]
+    tab_instruments, tab_storages, tab_limits, tab_taxes = st.tabs(
+        ["Инструменты", "Места хранения", "Ограничения", "Налоги"]
     )
 
     portfolio_blocks = _sorted_portfolio_blocks_for_settings(
@@ -866,6 +887,7 @@ def _render_rebalance_settings_dialog() -> None:
     min_purchase_default, min_deposit_default, buy_mode_default = (
         _read_rebalance_limits()
     )
+    tax_rate_default, _taxable_by_id = _read_tax_settings()
 
     with tab_instruments:
         st.caption(
@@ -991,6 +1013,50 @@ def _render_rebalance_settings_dialog() -> None:
         if buy_mode not in _BUY_ALLOCATION_OPTIONS:
             buy_mode = "max_gap"
 
+    with tab_taxes:
+        st.caption(
+            "Отметьте места хранения, где продажи облагаются налогом. "
+            "Расчёт ведётся по методу FIFO с учётом переводов между счетами; "
+            "себестоимость и выручка пересчитываются в рубли по курсу на дату операции."
+        )
+        if "rebalance_dialog_tax_rate_pct" not in st.session_state:
+            st.session_state["rebalance_dialog_tax_rate_pct"] = tax_rate_default * 100.0
+        tax_rate_pct = float(
+            st.number_input(
+                "Ставка налога, %",
+                min_value=0.0,
+                max_value=100.0,
+                step=1.0,
+                format="%.1f",
+                key="rebalance_dialog_tax_rate_pct",
+                help="Применяется к чистой налогооблагаемой базе (прибыль минус убытки).",
+            )
+        )
+        taxes_df = pd.DataFrame(
+            [
+                {
+                    "Место хранения": s.name,
+                    "Облагается налогом": bool(s.taxable),
+                }
+                for s in storages
+            ]
+        )
+        taxes_height = min(480, max(220, len(taxes_df) * 38 + 48))
+        edited_taxes = st.data_editor(
+            taxes_df,
+            width="stretch",
+            height=taxes_height,
+            hide_index=True,
+            disabled=["Место хранения"],
+            column_config={
+                "Место хранения": st.column_config.TextColumn("Место хранения"),
+                "Облагается налогом": st.column_config.CheckboxColumn(
+                    "Облагается налогом", default=False
+                ),
+            },
+            key="rebalance_settings_dialog_taxes",
+        )
+
     c1, c2 = st.columns(2)
     with c1:
         if st.button(
@@ -1006,6 +1072,11 @@ def _render_rebalance_settings_dialog() -> None:
                 edited_storages.to_dict("records"), storages_current
             )
             _persist_rebalance_limits(min_purchase, min_deposit, str(buy_mode))
+            _persist_tax_settings(
+                tax_rate_pct,
+                edited_taxes.to_dict("records"),
+                storages_current,
+            )
             st.rerun()
     with c2:
         if st.button(
@@ -1648,6 +1719,93 @@ def _render_rebalancing_results() -> None:
                 )
             if not sell_rows and not buy_rows:
                 st.caption("Нет сделок для этого места хранения.")
+
+    _render_rebalance_tax_section(
+        plan=plan,
+        display_ccy=display_ccy,
+        rub=rub,
+        eur=eur,
+    )
+
+
+def _render_rebalance_tax_section(
+    *,
+    plan,
+    display_ccy: str,
+    rub: float,
+    eur: float,
+) -> None:
+    if not plan.suggested_sells:
+        return
+
+    tax_rate, taxable_by_id = _read_tax_settings()
+    taxable_storage_ids = {sid for sid, flag in taxable_by_id.items() if flag}
+    summary = compute_rebalance_tax_summary(
+        plan.suggested_sells,
+        taxable_storage_ids=taxable_storage_ids,
+        tax_rate=tax_rate,
+        rub_per_usd=rub,
+        eur_per_usd=eur,
+        display_currency=display_ccy,
+    )
+
+    st.subheader(
+        "Налоги",
+        help=(
+            "Оценка налога на плановые продажи по методу FIFO в рублях. "
+            "Себестоимость — по курсу на дату покупки, выручка — по курсу на дату продажи. "
+            "Не влияет на расчёт ребалансировки."
+        ),
+    )
+
+    if not taxable_storage_ids:
+        st.info(
+            "Ни одно место хранения не отмечено как облагаемое. "
+            "Настройте это во вкладке «Налоги» в настройках ребалансировки."
+        )
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Прибыль", format_money(summary.total_gain_rub, "RUB"))
+        with c2:
+            st.metric("Убытки", format_money(summary.total_loss_rub, "RUB"))
+        with c3:
+            st.metric("Налоговая база", format_money(summary.net_taxable_base_rub, "RUB"))
+        with c4:
+            st.metric(
+                f"Налог ({summary.tax_rate * 100:.0f}%)",
+                format_money(summary.estimated_tax_rub, "RUB"),
+            )
+
+    if summary.dispositions:
+        lot_rows = [
+            {
+                "Тикер": d.ticker,
+                "Место хранения": d.storage_name,
+                "Кол-во": d.sell_qty,
+                "Дата покупки": d.acquired_date,
+                "Себестоимость": format_money(d.cost_rub, "RUB"),
+                "Выручка": format_money(d.proceeds_rub, "RUB"),
+                "Прибыль": format_money(d.gain_rub, "RUB"),
+            }
+            for d in summary.dispositions
+        ]
+        st.dataframe(
+            pd.DataFrame(lot_rows),
+            width="stretch",
+            hide_index=True,
+            key="rebalance_tax_lots_df",
+        )
+
+    if summary.exempt_sells:
+        exempt_parts = [
+            f"{s.ticker} ({s.storage_name}, {s.units:g} шт.)"
+            for s in summary.exempt_sells
+        ]
+        st.caption(f"Не облагается: {', '.join(exempt_parts)}")
+
+    for msg in summary.warnings:
+        st.warning(msg)
 
 
 def render_rebalancing():

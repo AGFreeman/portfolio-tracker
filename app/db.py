@@ -197,6 +197,15 @@ def _ensure_storage_rebalance_columns(conn: sqlite3.Connection) -> None:
             "ALTER TABLE storages ADD COLUMN rebalance_withdraw INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
+    cols = {
+        str(r["name"]).lower()
+        for r in conn.execute("PRAGMA table_info(storages)").fetchall()
+    }
+    if "taxable" not in cols:
+        conn.execute(
+            "ALTER TABLE storages ADD COLUMN taxable INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 def _migrate_legacy_ticker_blocks_to_storage(conn: sqlite3.Connection) -> None:
@@ -1743,11 +1752,13 @@ def get_default_storage_id() -> int:
 def list_storages() -> List[Storage]:
     conn = get_conn()
     try:
+        _ensure_storage_rebalance_columns(conn)
         rows = conn.execute(
             """
             SELECT id, name, sort_order,
                    COALESCE(rebalance_deposit, 1) AS rebalance_deposit,
-                   COALESCE(rebalance_withdraw, 0) AS rebalance_withdraw
+                   COALESCE(rebalance_withdraw, 0) AS rebalance_withdraw,
+                   COALESCE(taxable, 0) AS taxable
             FROM storages
             ORDER BY sort_order, name
             """
@@ -1758,7 +1769,8 @@ def list_storages() -> List[Storage]:
                 """
                 SELECT id, name, sort_order,
                        COALESCE(rebalance_deposit, 1) AS rebalance_deposit,
-                       COALESCE(rebalance_withdraw, 0) AS rebalance_withdraw
+                       COALESCE(rebalance_withdraw, 0) AS rebalance_withdraw,
+                       COALESCE(taxable, 0) AS taxable
                 FROM storages
                 ORDER BY sort_order, name
                 """
@@ -1770,6 +1782,7 @@ def list_storages() -> List[Storage]:
                 int(r["sort_order"]),
                 rebalance_deposit=int(r["rebalance_deposit"] or 0) == 1,
                 rebalance_withdraw=int(r["rebalance_withdraw"] or 0) == 1,
+                taxable=int(r["taxable"] or 0) == 1,
             )
             for r in rows
         ]
@@ -1793,6 +1806,19 @@ def set_storage_rebalance_flags(
             WHERE id = ?
             """,
             (1 if deposit else 0, 1 if withdraw else 0, sid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_storage_taxable_flag(storage_id: int, *, taxable: bool) -> None:
+    sid = int(storage_id)
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE storages SET taxable = ? WHERE id = ?",
+            (1 if taxable else 0, sid),
         )
         conn.commit()
     finally:
@@ -2126,6 +2152,23 @@ def add_transfer_transaction(
         conn.close()
 
 
+def _rows_to_transactions(rows) -> List[Transaction]:
+    default_sid = get_default_storage_id()
+    return [
+        Transaction(
+            r["id"],
+            r["ticker"],
+            r["amount"],
+            resolve_asset_subclass_id(r["ticker"]),
+            str(r["transaction_type"] or "trade"),
+            r["created_at"],
+            int(r["storage_id"]) if r["storage_id"] is not None else default_sid,
+            r["storage_name"],
+        )
+        for r in rows
+    ]
+
+
 def list_transactions() -> List[Transaction]:
     conn = get_conn()
     try:
@@ -2136,20 +2179,22 @@ def list_transactions() -> List[Transaction]:
                LEFT JOIN storages s ON s.id = t.storage_id
                ORDER BY t.created_at DESC, t.id DESC"""
         ).fetchall()
-        default_sid = get_default_storage_id()
-        return [
-            Transaction(
-                r["id"],
-                r["ticker"],
-                r["amount"],
-                resolve_asset_subclass_id(r["ticker"]),
-                str(r["transaction_type"] or "trade"),
-                r["created_at"],
-                int(r["storage_id"]) if r["storage_id"] is not None else default_sid,
-                r["storage_name"],
-            )
-            for r in rows
-        ]
+        return _rows_to_transactions(rows)
+    finally:
+        conn.close()
+
+
+def list_transactions_chronological() -> List[Transaction]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT t.id, t.ticker, t.amount, t.transaction_type, t.created_at,
+                      t.storage_id, s.name AS storage_name
+               FROM transactions t
+               LEFT JOIN storages s ON s.id = t.storage_id
+               ORDER BY t.created_at ASC, t.id ASC"""
+        ).fetchall()
+        return _rows_to_transactions(rows)
     finally:
         conn.close()
 

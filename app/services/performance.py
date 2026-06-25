@@ -1206,6 +1206,61 @@ def _lookup_tx_value(
     )
 
 
+def build_price_index_by_tickers(
+    tickers: Iterable[str],
+    date_from: str,
+    date_to: str,
+) -> Dict[str, Tuple[List[str], List[PriceQuote]]]:
+    """Build as-of price indexes for tickers over [date_from, date_to]."""
+    out: Dict[str, Tuple[List[str], List[PriceQuote]]] = {}
+    for ticker in {str(t or "").upper().strip() for t in tickers if str(t or "").strip()}:
+        series = _load_price_series_from_cache(ticker, date_from, date_to)
+        series = _normalize_price_series(ticker, series)
+        out[ticker] = _build_as_of_price_index(series)
+    return out
+
+
+def lookup_transaction_value(
+    ticker: str,
+    amount: float,
+    day: str,
+    target_currency: str,
+    rub_per_usd: float,
+    eur_per_usd: float,
+    as_of_index_by_ticker: Mapping[str, Tuple[List[str], List[PriceQuote]]],
+) -> Optional[float]:
+    """Transaction notional in target currency using quote on or before `day`."""
+    return _lookup_tx_value(
+        ticker,
+        amount,
+        day,
+        as_of_index_by_ticker,
+        target_currency,
+        rub_per_usd,
+        eur_per_usd,
+    )
+
+
+def load_historical_fx(date_from: str, date_to: str) -> Dict[str, Tuple[float, float]]:
+    """Historical (rub_per_usd, eur_per_usd) by day from app_settings."""
+    return _load_fx_exact_from_db(date_from, date_to)
+
+
+def fx_rates_for_day(
+    day: str,
+    fx_exact: Mapping[str, Tuple[float, float]],
+    spot_rub_per_usd: float,
+    spot_eur_per_usd: float,
+) -> Tuple[float, float]:
+    """Last known FX on or before `day`, falling back to spot."""
+    recent = (float(spot_rub_per_usd), float(spot_eur_per_usd))
+    for d in sorted(fx_exact.keys()):
+        if d > day:
+            break
+        recent = fx_exact[d]
+    return recent
+
+
 def _series_value_on_or_after(
     series: List[PerformancePoint],
     date_iso: str,
