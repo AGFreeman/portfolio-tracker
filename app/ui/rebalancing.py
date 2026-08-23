@@ -21,7 +21,7 @@ from app.db import (
     set_storage_rebalance_flags,
     set_storage_taxable_flag,
 )
-from app.services.fx import convert_amount, format_money
+from app.services.fx import convert_amount, format_money, refresh_fx_cache
 from app.services.performance import compute_ticker_unrealized_pnl_pct
 from app.services.portfolio_order import (
     build_portfolio_ticker_order,
@@ -91,7 +91,6 @@ def _persist_tax_settings(rate_pct: float, edited_rows: list[dict], current: lis
         set_storage_taxable_flag(storage_id, taxable=bool(row["Облагается налогом"]))
 
 
-_STORAGE_GROUPS = ("Foreign Brokers", "Russian Brokers", "Crypto")
 _REBALANCE_TABLE_COLUMNS = (
     "Подкласс",
     "Тикер",
@@ -125,19 +124,6 @@ def _entry_has_fixed_storage(entry: dict) -> bool:
     return bool(storage_name) and storage_name != "—"
 
 
-def _entry_belongs_to_group(
-    entry: dict,
-    group: str,
-    storages_by_ticker_unblocked: dict[str, list[str]],
-) -> bool:
-    if _entry_has_fixed_storage(entry):
-        return _storage_group(str(entry.get("storage_name") or "")) == group
-    t_up = str(entry["ticker"]).upper()
-    return any(
-        _storage_group(sn) == group for sn in storages_by_ticker_unblocked.get(t_up, [])
-    )
-
-
 def _sort_trade_entries(
     entries: list[dict],
     *,
@@ -159,43 +145,6 @@ def _sort_buy_entries(
     ticker_order: dict[str, int],
 ) -> list[dict]:
     return _sort_trade_entries(buy_entries, ticker_order=ticker_order)
-
-
-def _storage_group(storage_name: str) -> str | None:
-    n = (storage_name or "").strip().casefold()
-    if not n:
-        return None
-    if "interactive brokers" in n or n == "ib" or "freedom finance" in n or n == "ff":
-        return "Foreign Brokers"
-    if (
-        "тинько" in n
-        or "т-банк" in n
-        or "тбанк" in n
-        or "t-bank" in n
-        or "tbank" in n
-        or n == "bcs"
-        or "бкс" in n
-    ):
-        return "Russian Brokers"
-    if any(
-        x in n
-        for x in (
-            "wallet",
-            "ledger",
-            "metamask",
-            "trust",
-            "tangem",
-            "binance",
-            "bybit",
-            "okx",
-            "kucoin",
-            "gate",
-            "mexc",
-            "crypto",
-        )
-    ):
-        return "Crypto"
-    return None
 
 
 def _render_storage_cash_flow_table(
@@ -244,31 +193,6 @@ def _render_storage_cash_flow_table(
         hide_index=True,
         width="stretch",
     )
-
-
-def _amount_by_storage_group(
-    ticker: str,
-    amount: float,
-    storages_by_ticker: dict[str, list[str]],
-) -> dict[str, float]:
-    storage_names = storages_by_ticker.get(str(ticker).upper(), [])
-    if not storage_names or amount <= 0:
-        return {}
-    per_storage = float(amount) / float(len(storage_names))
-    by_group: dict[str, float] = defaultdict(float)
-    for storage_name in storage_names:
-        grp = _storage_group(storage_name)
-        if grp in _STORAGE_GROUPS:
-            by_group[grp] += per_storage
-    return dict(by_group)
-
-
-def _spend_by_storage_group(
-    ticker: str,
-    implied_spend: float,
-    storages_by_ticker_unblocked: dict[str, list[str]],
-) -> dict[str, float]:
-    return _amount_by_storage_group(ticker, implied_spend, storages_by_ticker_unblocked)
 
 
 def _format_signed_money(value: float, currency: str) -> str:
@@ -721,94 +645,6 @@ def _as_portfolio_dataframe(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)[list(_REBALANCE_PORTFOLIO_COLUMNS)]
 
 
-def _build_group_funding_plan(
-    raw_totals: dict[str, float],
-    input_amount: float,
-    min_group_amount: float = 20_000.0,
-    round_step: float = 1_000.0,
-) -> tuple[dict[str, float], float, list[str]]:
-    """
-    Iterative post-processing for storage-group funding:
-    1) absorb residual into groups,
-    2) relocate too-small groups (< min_group_amount),
-    3) round to round_step while preserving total when possible.
-    Returns (group_totals, unsettled_cash, notes).
-    """
-    notes: list[str] = []
-    groups = {
-        k: float(raw_totals.get(k, 0.0))
-        for k in ("Foreign Brokers", "Russian Brokers", "Crypto")
-    }
-    V = max(0.0, float(input_amount))
-    if V <= 0:
-        return groups, 0.0, notes
-
-    def _primary_group() -> str:
-        return (
-            max(groups.keys(), key=lambda g: groups[g])
-            if any(groups.values())
-            else "Russian Brokers"
-        )
-
-    # Step 1: absorb residual/non-grouped amounts into primary group.
-    allocated = sum(groups.values())
-    residual = V - allocated
-    if abs(residual) > 1e-9:
-        pg = _primary_group()
-        groups[pg] += residual
-        notes.append(f"Остаток {residual:+.2f} добавлен в группу {pg}.")
-
-    # Step 2: relocate tiny groups.
-    changed = True
-    while changed:
-        changed = False
-        for g in list(groups.keys()):
-            amt = float(groups[g])
-            if 0.0 < amt < float(min_group_amount):
-                receivers = [x for x in groups.keys() if x != g]
-                receiver = (
-                    max(receivers, key=lambda x: groups[x]) if receivers else None
-                )
-                if receiver is None:
-                    continue
-                groups[receiver] += amt
-                groups[g] = 0.0
-                notes.append(
-                    f"Группа {g} (< {int(min_group_amount)}): {amt:.2f} перенесено в {receiver}."
-                )
-                changed = True
-
-    # Step 3: round groups to round_step with iterative balancing.
-    step = float(round_step)
-    if step > 0:
-        rounded = {g: float(step * round(groups[g] / step)) for g in groups.keys()}
-        delta = float(V - sum(rounded.values()))
-        # If V is not divisible by step, exact 0 unsettled is mathematically impossible.
-        # We still reduce unsettled to |delta| < step by rebalancing in step chunks.
-        iter_guard = 0
-        while abs(delta) >= step - 1e-9 and iter_guard < 10000:
-            iter_guard += 1
-            if delta > 0:
-                g = max(rounded.keys(), key=lambda x: groups[x])
-                rounded[g] += step
-                delta -= step
-            else:
-                candidates = [x for x in rounded.keys() if rounded[x] >= step]
-                if not candidates:
-                    break
-                g = max(candidates, key=lambda x: rounded[x])
-                rounded[g] -= step
-                delta += step
-        groups = rounded
-        if abs(delta) > 0.01:
-            notes.append(
-                f"Точная сходимость до 0 невозможна из-за шага {int(step)} и суммы ввода; остаток {delta:+.2f}."
-            )
-        return groups, float(delta), notes
-
-    return groups, 0.0, notes
-
-
 def _persist_rebalance_settings(edited_rows: list[dict], current: list[dict]) -> None:
     id_by_key = {
         (str(r["ticker"]).upper(), str(r["storage_name"])): int(r["storage_id"])
@@ -1119,6 +955,7 @@ def _render_rebalancing_controls() -> None:
             width="stretch",
         ):
             request_quotes_refresh()
+            refresh_fx_cache()
             st.session_state["rebalance_last_V"] = float(V)
             st.rerun()
     with btn_col2:
@@ -1137,7 +974,6 @@ def _render_rebalancing_results() -> None:
     eur = float(fx.get("eur") or 0.92)
     process_messages_intro: list[str] = []
     process_messages_warnings: list[str] = []
-    process_messages_checks: list[str] = []
     process_messages_residuals: list[str] = []
     warnings: list[str] = []
 
@@ -1321,6 +1157,11 @@ def _render_rebalancing_results() -> None:
             "Неразмещённая выручка от продаж (кратность лотов): "
             f"{format_money(plan.residual_sell_proceeds, display_ccy)}."
         )
+    if abs(plan.residual_vs_V) > 0.01:
+        process_messages_residuals.append(
+            "Неразмещённый внешний ввод (лотность/округление): "
+            f"{format_money(plan.residual_vs_V, display_ccy)}."
+        )
     mode_label = (
         "пропорционально"
         if buy_allocation_mode == "proportional"
@@ -1399,9 +1240,6 @@ def _render_rebalancing_results() -> None:
         class_sort_by_id=class_sort_by_id,
     )
 
-    group_totals_raw = {"Foreign Brokers": 0.0, "Russian Brokers": 0.0, "Crypto": 0.0}
-    unmapped_group_total = 0.0
-
     buy_entries = [
         {
             "ticker": b.ticker,
@@ -1428,42 +1266,6 @@ def _render_rebalancing_results() -> None:
         }
         for s in plan.suggested_sells
     ]
-    buys_sorted = _sort_buy_entries(buy_entries, ticker_order=ticker_order)
-    for b in buys_sorted:
-        if _entry_has_fixed_storage(b):
-            continue
-        ticker_unblocked_storages = storages_by_ticker_unblocked.get(
-            str(b["ticker"]).upper(), []
-        )
-        if ticker_unblocked_storages:
-            per_storage = float(b["implied_spend"]) / float(
-                len(ticker_unblocked_storages)
-            )
-            for storage_name in ticker_unblocked_storages:
-                grp = _storage_group(storage_name)
-                if grp in group_totals_raw:
-                    group_totals_raw[grp] += per_storage
-                else:
-                    unmapped_group_total += per_storage
-
-    if unmapped_group_total > 0:
-        # Treat unmapped storages as additional residual to be redistributed by planner.
-        primary = (
-            max(group_totals_raw.keys(), key=lambda g: group_totals_raw[g])
-            if any(group_totals_raw.values())
-            else "Russian Brokers"
-        )
-        group_totals_raw[primary] += float(unmapped_group_total)
-
-    funding_input = float(run_v)
-    group_totals, unsettled_after_groups, plan_notes = _build_group_funding_plan(
-        group_totals_raw,
-        funding_input,
-        min_group_amount=20_000.0,
-        round_step=5_000.0,
-    )
-    if plan_notes:
-        process_messages_intro.extend(plan_notes)
 
     value_by_ticker, value_after_by_ticker, total_before, total_after = (
         _build_rebalance_value_state(
@@ -1486,79 +1288,9 @@ def _render_rebalancing_results() -> None:
     storage_sort_order = {str(s.name): int(s.sort_order) for s in all_storages}
     storage_id_by_name = {str(s.name): int(s.id) for s in all_storages}
 
-    # Rounded group plan (step = 5,000 RUB) is display-only; buy_entries come from optimizer.
-    realized_group_totals = {
-        "Foreign Brokers": 0.0,
-        "Russian Brokers": 0.0,
-        "Crypto": 0.0,
-    }
-    for b in buy_entries:
-        if _entry_has_fixed_storage(b):
-            continue
-        ticker_unblocked_storages = storages_by_ticker_unblocked.get(
-            str(b["ticker"]).upper(), []
-        )
-        if not ticker_unblocked_storages:
-            continue
-        per_storage = float(b["implied_spend"]) / float(len(ticker_unblocked_storages))
-        for storage_name in ticker_unblocked_storages:
-            grp = _storage_group(storage_name)
-            if grp in realized_group_totals:
-                realized_group_totals[grp] += per_storage
-
-    grouped_plus_unsettled = (
-        float(group_totals["Foreign Brokers"])
-        + float(group_totals["Russian Brokers"])
-        + float(group_totals["Crypto"])
-        + float(unsettled_after_groups)
-    )
-    check_delta = float(funding_input) - grouped_plus_unsettled
-    if abs(check_delta) <= 0.01:
-        process_messages_checks.append(
-            "Проверка сумм успешна: группы + unsettled = "
-            f"{format_money(grouped_plus_unsettled, display_ccy)} "
-            f"(внешний ввод: {format_money(funding_input, display_ccy)})."
-        )
-    else:
-        process_messages_checks.append(
-            "Проверка сумм не сошлась: группы + unsettled = "
-            f"{format_money(grouped_plus_unsettled, display_ccy)}, "
-            f"внешний ввод = {format_money(funding_input, display_ccy)}, "
-            f"дельта = {format_money(check_delta, display_ccy)}. "
-            f"Неразмеченные места хранения: {format_money(unmapped_group_total, display_ccy)}."
-        )
-    if plan_notes:
-        process_messages_residuals.extend(plan_notes)
-    realized_total = sum(float(v) for v in realized_group_totals.values())
-    realized_delta = float(funding_input) - float(realized_total)
-    if abs(realized_delta) > 0.01:
-        process_messages_residuals.append(
-            "Фактическое исполнение по инструментам может отличаться от строгого плана групп "
-            f"из-за лотности/дробности; дельта исполнения: {format_money(realized_delta, display_ccy)}."
-        )
-    external_buy_entries = [e for e in buy_entries if not _entry_has_fixed_storage(e)]
-    realized_buy_total = sum(float(e["implied_spend"]) for e in external_buy_entries)
-    realized_sell_total = sum(float(e["implied_proceeds"]) for e in sell_entries)
-    realized_vs_input = float(funding_input) - float(realized_buy_total)
-    process_messages_checks.append(
-        f"Фактические продажи: {format_money(realized_sell_total, display_ccy)}."
-    )
-    process_messages_checks.append(
-        f"Покупки на внешний ввод: {format_money(realized_buy_total, display_ccy)}. "
-        f"Дельта к внешнему вводу: {format_money(realized_vs_input, display_ccy)}."
-    )
-    process_messages_residuals.append(
-        "Строгий остаток плана групп: "
-        f"{format_money(float(unsettled_after_groups), display_ccy)}."
-    )
-    process_messages_residuals.append(
-        "Остаток базового алгоритма (до распределения по группам): "
-        f"{format_money(float(plan.residual_vs_V), display_ccy)}."
-    )
     process_messages = (
         process_messages_intro
         + process_messages_warnings
-        + process_messages_checks
         + process_messages_residuals
     )
     constraint_gaps = list(plan.constraint_gaps)

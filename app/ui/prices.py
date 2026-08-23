@@ -20,6 +20,7 @@ from app.db import (
     list_transactions,
 )
 from app.services.fx import convert_amount
+from app.services.historical_quotes import sync_portfolio_historical_quotes
 from app.services.performance import (
     _build_active_intervals_by_ticker,
     _build_as_of_price_index,
@@ -723,6 +724,14 @@ def render_prices() -> None:
     currency_mode = "quote" if currency_mode_label == "Quote" else "display"
     show_trades = trades_label == "On"
     ticker_up = str(ticker or ticker_options[0]).upper()
+
+    today = date.today().isoformat()
+    portfolio_sync_key = f"_portfolio_hist_quotes_synced_{today}"
+    if portfolio_sync_key not in st.session_state:
+        with st.spinner("Обновление исторических котировок портфеля…"):
+            sync_portfolio_historical_quotes(date_to=today)
+        st.session_state[portfolio_sync_key] = True
+        db_mtime = float(db_path.stat().st_mtime) if db_path.exists() else 0.0
 
     with st.spinner("Загрузка котировок…"):
         raw_df, dates, quotes, quote_ccy, date_from, date_to = _load_ticker_chart_data_cached(

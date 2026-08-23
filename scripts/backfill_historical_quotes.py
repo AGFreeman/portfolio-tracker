@@ -21,15 +21,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import json  # noqa: E402
-
 from app.db import (  # noqa: E402
     delete_historical_quotes_in_range,
     init_db,
-    set_app_setting,
     upsert_historical_quotes_bulk,
 )
-from app.services.fx import get_historical_usd_cross_rates_exact  # noqa: E402
+from app.services.fx import sync_historical_fx  # noqa: E402
 from app.services.performance import (  # noqa: E402
     _DEFAULT_MONEY_MARKET_BENCHMARKS,
     _build_active_intervals_by_ticker,
@@ -166,12 +163,8 @@ def main() -> int:
                     print(f"FAIL {t}: {exc}")
 
     if not args.dry_run:
-        fx = get_historical_usd_cross_rates_exact(first_tx_date, end)
-        set_app_setting(
-            "historical_fx_v1",
-            json.dumps({d: [rub, eur] for d, (rub, eur) in fx.items()}),
-        )
-        print(f"FX cache: {len(fx)} days stored in app_settings")
+        fx_days = sync_historical_fx(date_from=first_tx_date, date_to=end)
+        print(f"FX cache: {fx_days} days upserted into app_settings")
 
     print(f"Done. deleted≈{total_deleted} inserted≈{total_inserted}")
     return 0

@@ -292,8 +292,10 @@ def _ensure_data_dir():
 
 def get_conn() -> sqlite3.Connection:
     _ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -2034,6 +2036,21 @@ def upsert_historical_quotes_bulk(rows: List[tuple]) -> None:
             normalized_rows,
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_max_historical_quote_date(ticker: str) -> Optional[str]:
+    """Return the latest cached quote_date for ticker, or None if no rows."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT MAX(quote_date) FROM historical_quotes WHERE ticker = ?",
+            (str(ticker or "").strip().upper(),),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
     finally:
         conn.close()
 

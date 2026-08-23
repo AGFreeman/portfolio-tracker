@@ -3,7 +3,7 @@ import time
 
 import streamlit as st
 
-from app.services.fx import fetch_usd_cross_rates
+from app.services.fx import refresh_fx_cache
 from app.services.prices import request_quotes_refresh
 from app.ui.cash_flows import render_cash_flow_sidebar
 from app.ui.live_refresh import live_quotes_run_every
@@ -16,14 +16,12 @@ def _render_fx_live_block_body():
     first_bootstrap = not bool(cache)
 
     if live_updates_enabled or first_bootstrap:
-        rub, eur, source, err = fetch_usd_cross_rates()
-        st.session_state["fx_cache"] = {
-            "ts": time.time(),
-            "rub": rub,
-            "eur": eur,
-            "source": source,
-            "err": err,
-        }
+        refresh_fx_cache()
+        cache = st.session_state.get("fx_cache") or {}
+        rub = float(cache.get("rub") or 95.0)
+        eur = float(cache.get("eur") or 0.92)
+        source = str(cache.get("source") or "cached")
+        err = cache.get("err")
     else:
         rub = float(cache.get("rub") or 95.0)
         eur = float(cache.get("eur") or 0.92)
@@ -91,14 +89,7 @@ def render_currency_sidebar():
         request_quotes_refresh()
         st.session_state["_prev_live_price_updates_enabled"] = curr_live
     if st.button("Force price update", key="force_price_update_now"):
-        rub, eur, source, err = fetch_usd_cross_rates()
-        st.session_state["fx_cache"] = {
-            "ts": time.time(),
-            "rub": rub,
-            "eur": eur,
-            "source": source,
-            "err": err,
-        }
+        refresh_fx_cache()
         request_quotes_refresh()
         st.rerun()
 

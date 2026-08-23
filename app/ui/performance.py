@@ -4,6 +4,7 @@ import colorsys
 import json
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date
 
 import plotly.graph_objects as go
 import pandas as pd
@@ -20,7 +21,8 @@ from app.db import (
     list_cash_flows,
     list_positions_by_ticker,
 )
-from app.services.fx import format_money
+from app.services.fx import format_money, HISTORICAL_FX_SETTING_KEY
+from app.services.historical_quotes import sync_portfolio_historical_quotes
 from app.services.prices import (
     get_app_quotes,
     get_quotes_cache_meta,
@@ -836,7 +838,7 @@ def _add_stacked_breakdown_trace(
     )
 
 
-_HISTORICAL_FX_SETTING_KEY = "historical_fx_v1"
+_HISTORICAL_FX_SETTING_KEY = HISTORICAL_FX_SETTING_KEY
 
 
 def _build_fx_to_rub_df(
@@ -1250,6 +1252,14 @@ def render_performance() -> None:
     fx = st.session_state.get("fx_cache") or {}
     rub = float(fx.get("rub") or 95.0)
     eur = float(fx.get("eur") or 0.92)
+
+    today = date.today().isoformat()
+    portfolio_sync_key = f"_portfolio_hist_quotes_synced_{today}"
+    if portfolio_sync_key not in st.session_state:
+        with st.spinner("Обновление исторических котировок портфеля…"):
+            sync_portfolio_historical_quotes(date_to=today)
+        st.session_state[portfolio_sync_key] = True
+
     # Keep behavior consistent with top summary metrics: if no current quotes are
     # available for any active instrument, do not show historical performance charts.
     current_positions = list_positions_by_ticker()

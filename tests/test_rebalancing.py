@@ -23,9 +23,6 @@ from app.services.rebalancing import (
     split_subclass_budget_to_tickers,
     units_and_implied_spend,
 )
-from app.ui.rebalancing import _build_group_funding_plan
-
-
 class TestNormalizeWeights(unittest.TestCase):
     def test_sum_to_one(self):
         w, raw, norm = normalize_subclass_weights({1: 50.0, 2: 50.0})
@@ -642,22 +639,6 @@ class TestDeviationOptimizer(unittest.TestCase):
                 0.0,
             )
             self.assertGreaterEqual(val, float(targets.get(t, 0.0)) - 1e-6)
-
-
-class TestGroupFundingPlan(unittest.TestCase):
-    def test_groups_round_to_5000(self):
-        raw = {
-            "Foreign Brokers": 37_300.0,
-            "Russian Brokers": 42_700.0,
-            "Crypto": 0.0,
-        }
-        groups, unsettled, _ = _build_group_funding_plan(
-            raw, 80_000.0, min_group_amount=20_000.0, round_step=5_000.0
-        )
-        for amt in groups.values():
-            if amt > 0.01:
-                self.assertAlmostEqual(amt % 5_000.0, 0.0, places=5)
-        self.assertAlmostEqual(sum(groups.values()) + unsettled, 80_000.0, places=2)
 
 
 class TestRebalanceDiagnostics(unittest.TestCase):

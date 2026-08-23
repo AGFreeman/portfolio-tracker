@@ -31,10 +31,16 @@ st.session_state.pop("_active_portfolio_tickers", None)
 
 # Базовая инициализация БД без автоприменения миграций:
 # на этапе активной разработки структура и данные поддерживаются вручную.
-init_db()
-seed_asset_classes_if_empty()
-apply_default_target_percentages_if_unset()
-reconcile_asset_class_targets()
+@st.cache_resource
+def _ensure_db_initialized() -> bool:
+    init_db()
+    seed_asset_classes_if_empty()
+    apply_default_target_percentages_if_unset()
+    reconcile_asset_class_targets()
+    return True
+
+
+_ensure_db_initialized()
 
 with st.sidebar:
     render_currency_sidebar()

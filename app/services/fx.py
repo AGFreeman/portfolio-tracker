@@ -1,5 +1,8 @@
 """Курсы валют (к USD) и конвертация для отображения портфеля."""
-from datetime import datetime, timedelta
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -8,6 +11,7 @@ import requests
 _FALLBACK_RUB_PER_USD = 95.0
 _FALLBACK_EUR_PER_USD = 0.92
 _YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+HISTORICAL_FX_SETTING_KEY = "historical_fx_v1"
 
 
 def _iter_dates(date_from: str, date_to: str) -> List[str]:
@@ -104,6 +108,88 @@ def get_historical_usd_cross_rates_exact(
     return out
 
 
+def _load_historical_fx_cache() -> Dict[str, List[float]]:
+    from app.db import get_app_setting
+
+    raw = get_app_setting(HISTORICAL_FX_SETTING_KEY)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, List[float]] = {}
+    for day, pair in data.items():
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        try:
+            rub, eur = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError):
+            continue
+        if rub > 0 and eur > 0:
+            out[str(day)] = [rub, eur]
+    return out
+
+
+def get_max_historical_fx_date() -> Optional[str]:
+    """Latest quote_date stored in historical_fx_v1, or None."""
+    cache = _load_historical_fx_cache()
+    if not cache:
+        return None
+    return max(cache.keys())
+
+
+def sync_historical_fx(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> int:
+    """
+    Fetch missing FX days and merge into historical_fx_v1.
+    Returns number of days written/updated.
+    """
+    from app.db import set_app_setting
+
+    end = str(date_to or date.today().isoformat())
+    existing = _load_historical_fx_cache()
+    last = max(existing.keys()) if existing else None
+
+    if last is None:
+        if not date_from:
+            return 0
+        fetch_from = str(date_from)
+    elif last >= end:
+        return 0
+    else:
+        fetch_from = (
+            datetime.strptime(last, "%Y-%m-%d").date() + timedelta(days=1)
+        ).isoformat()
+
+    if fetch_from > end:
+        return 0
+
+    fetched = get_historical_usd_cross_rates_exact(fetch_from, end)
+
+    # Yahoo daily series may lag / skip weekends; keep charts current with spot.
+    if end not in fetched:
+        rub, eur, _source, _err = fetch_usd_cross_rates()
+        if rub > 0 and eur > 0:
+            fetched[end] = (float(rub), float(eur))
+
+    if not fetched:
+        return 0
+
+    for day, (rub, eur) in fetched.items():
+        existing[str(day)] = [float(rub), float(eur)]
+
+    set_app_setting(
+        HISTORICAL_FX_SETTING_KEY,
+        json.dumps({d: existing[d] for d in sorted(existing.keys())}),
+    )
+    return len(fetched)
+
+
 def _fetch_yahoo_pair_rate(symbol: str) -> Optional[float]:
     """Возвращает последний close для Yahoo пары, например USDRUB=X."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -163,6 +249,22 @@ def fetch_usd_cross_rates() -> Tuple[float, float, str, Optional[str]]:
         return rub, eur, "open.er-api", "используется open.er-api (daily snapshot)"
     except Exception as e:
         return _FALLBACK_RUB_PER_USD, _FALLBACK_EUR_PER_USD, "Fallback (fixed)", str(e)
+
+
+def refresh_fx_cache() -> None:
+    """Fetch spot USD cross rates and store in Streamlit session_state."""
+    import time
+
+    import streamlit as st
+
+    rub, eur, source, err = fetch_usd_cross_rates()
+    st.session_state["fx_cache"] = {
+        "ts": time.time(),
+        "rub": rub,
+        "eur": eur,
+        "source": source,
+        "err": err,
+    }
 
 
 def to_usd(amount: float, from_ccy: str, rub_per_usd: float, eur_per_usd: float) -> float:

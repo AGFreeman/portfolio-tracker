@@ -20,7 +20,7 @@ from app.services.policy_rates import (
     load_policy_rate_series,
     uses_synthetic_policy_benchmark,
 )
-from app.services.fx import convert_amount
+from app.services.fx import HISTORICAL_FX_SETTING_KEY, convert_amount
 from app.services.price_currency import infer_quote_currency
 from app.services.prices import (
     PriceQuote,
@@ -167,12 +167,9 @@ def _load_daily_manual_cash_flows(
     return flows_by_day, min(dates), max(dates)
 
 
-_HISTORICAL_FX_SETTING_KEY = "historical_fx_v1"
-
-
 def _load_fx_exact_from_db(date_from: str, date_to: str) -> Dict[str, Tuple[float, float]]:
-    """Load pre-built FX series from app_settings (filled by backfill script)."""
-    raw = get_app_setting(_HISTORICAL_FX_SETTING_KEY)
+    """Load pre-built FX series from app_settings (filled by backfill / sync)."""
+    raw = get_app_setting(HISTORICAL_FX_SETTING_KEY)
     if not raw:
         return {}
     try:
